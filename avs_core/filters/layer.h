@@ -43,6 +43,7 @@
 #define __Layer_H__
 
 #include <avisynth.h>
+#include <stdint.h>
 
 
 /********************************************************************
@@ -74,6 +75,9 @@ private:
   const PClip child1, child2;
   VideoInfo vi;
   int mask_frames;
+  int pixelsize;
+  int bits_per_pixel;
+
 };
 
 
@@ -95,6 +99,12 @@ public:
 
 private:
   const int color, tolB, tolG, tolR;
+  uint64_t color64;
+  int tolB16, tolG16, tolR16;
+  int pixelsize;
+  int bits_per_pixel;
+  int max_pixel_value;
+
 };
 
 
@@ -105,7 +115,7 @@ class ResetMask : public GenericVideoFilter
 **/
 {
 public:
-  ResetMask(PClip _child, IScriptEnvironment* env);
+  ResetMask(PClip _child, float _mask_f, IScriptEnvironment* env);
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env);
 
   int __stdcall SetCacheHints(int cachehints, int frame_range) override {
@@ -113,6 +123,10 @@ public:
   }
 
   static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
+
+private:
+    float mask_f;
+    int mask;
 };
 
 
@@ -135,6 +149,10 @@ private:
   int mask;
   bool doB, doG, doR, doA;
   bool doY, doU, doV;
+
+  unsigned __int64 mask64;
+  int pixelsize;
+  int bits_per_pixel; // 8,10..16
 };
 
 
@@ -154,8 +172,14 @@ public:
 
   static AVSValue __cdecl Create(AVSValue args, void* channel, IScriptEnvironment* env);
 private:
-  const int channel;
+  int channel;
   const int input_type;
+  const int pixelsize;
+  const int bits_per_pixel;
+  bool input_type_is_planar_rgb;
+  bool input_type_is_planar_rgba;
+  bool input_type_is_yuv;
+  bool input_type_is_yuva;
 };
 
 
@@ -212,7 +236,7 @@ private:
   const PClip child1, child2;
   VideoInfo vi;
   const  char* Op;
-  const int levelB, T;
+  int levelB, ThresholdParam;
   int ydest, xdest, ysrc, xsrc, ofsX, ofsY, ycount, xcount, overlay_frames;
   const bool chroma;
 
@@ -248,7 +272,9 @@ private:
 
 // Common to all instances
   static bool DiffFlag;
-  static BYTE Diff[513];
+  static BYTE LUT_Diff8[513]; 
+  int pixelsize;
+  int bits_per_pixel;
 
 };
 

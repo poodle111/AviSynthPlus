@@ -208,6 +208,10 @@ void Tokenizer::NextToken() {
     case '}':
     case '(':
     case ')':
+#ifdef NEW_AVSVALUE
+    case '[': // array definition 
+    case ']':
+#endif
     case ',':
     case '?':
     case ':':

@@ -49,7 +49,8 @@ static HFONT LoadFont(const char name[], int size, bool bold, bool italic, int w
 {
   return CreateFont( size, width, angle, angle, bold ? FW_BOLD : FW_NORMAL,
                      italic, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FF_DONTCARE | DEFAULT_PITCH, name );
+                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FF_DONTCARE | FIXED_PITCH /*FF_DONTCARE | DEFAULT_PITCH*/, name );
+  // avs+: force fixed pitch when font is not found by name
 }
 
 /********************************************************************
@@ -69,7 +70,7 @@ extern const AVSFunction Text_filters[] = {
 	"c[offset_f]i[x]f[y]f[font]s[size]f[text_color]i[halo_color]i[font_width]f[font_angle]f",
 	ShowSMPTE::CreateTime },
 
-  { "Info", BUILTIN_FUNC_PREFIX, "c", FilterInfo::Create },  // clip
+  { "Info", BUILTIN_FUNC_PREFIX, "c[font]s[size]f[text_color]i[halo_color]i", FilterInfo::Create },  // clip
 
   { "Subtitle",BUILTIN_FUNC_PREFIX,
 	"cs[x]f[y]f[first_frame]i[last_frame]i[font]s[size]f[text_color]i[halo_color]i"
@@ -184,7 +185,7 @@ void Antialiaser::Apply( const VideoInfo& vi, PVideoFrame* frame, int pitch)
               (*frame)->GetWritePtr(PLANAR_U),
               (*frame)->GetWritePtr(PLANAR_V) );
   else if (vi.NumComponents() == 1) // Y8, Y16, Y32
-    ApplyPlanar((*frame)->GetWritePtr(), pitch, 0, 0, 0, 0, 0, vi.ComponentSize());
+    ApplyPlanar((*frame)->GetWritePtr(), pitch, 0, 0, 0, 0, 0, vi.BitsPerComponent());
   else if (vi.IsPlanar()) {
       if(vi.IsPlanarRGB() || vi.IsPlanarRGBA())
           // color are OK if plane order is sent as G R B
@@ -194,15 +195,15 @@ void Antialiaser::Apply( const VideoInfo& vi, PVideoFrame* frame, int pitch)
             (*frame)->GetWritePtr(PLANAR_B),
             vi.GetPlaneWidthSubsampling(PLANAR_G),  // no subsampling
             vi.GetPlaneHeightSubsampling(PLANAR_G),
-            vi.ComponentSize() );
+            vi.BitsPerComponent() );
       else
         ApplyPlanar((*frame)->GetWritePtr(), pitch,
-                    (*frame)->GetPitch(PLANAR_U),
-                    (*frame)->GetWritePtr(PLANAR_U),
-                    (*frame)->GetWritePtr(PLANAR_V),
-                    vi.GetPlaneWidthSubsampling(PLANAR_U),
-                    vi.GetPlaneHeightSubsampling(PLANAR_U),
-                    vi.ComponentSize());
+            (*frame)->GetPitch(PLANAR_U),
+            (*frame)->GetWritePtr(PLANAR_U),
+            (*frame)->GetWritePtr(PLANAR_V),
+            vi.GetPlaneWidthSubsampling(PLANAR_U),
+            vi.GetPlaneHeightSubsampling(PLANAR_U),
+            vi.BitsPerComponent());
   }
 }
 
@@ -249,7 +250,9 @@ void Antialiaser::ApplyYV12(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE*
 }
 
 
-void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE* bufV, int shiftX, int shiftY, int pixelsize) {
+template<int shiftX, int shiftY, int bits_per_pixel>
+void Antialiaser::ApplyPlanar_core(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE* bufV)
+{
   const int stepX = 1<<shiftX;
   const int stepY = 1<<shiftY;
 
@@ -264,7 +267,247 @@ void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYT
 
   // Apply Y
   // different paths for different bitdepth
-  if(pixelsize == 1) {
+  // todo PF 161208 shiftX shiftY bits_per_pixel templates
+  // perpaps int->byte, short (faster??)
+  if(bits_per_pixel == 8) {
+    for (int y=yb; y<=yt; y+=1) {
+      for (int x=xl; x<=xr; x+=1) {
+        const int x4 = x<<2;
+        const int basealpha = alpha[x4+0];
+        if (basealpha != 256) {
+          buf[x] = BYTE((buf[x] * basealpha + alpha[x4 + 3]) >> 8);
+        }
+      }
+      buf += pitch;
+      alpha += w4;
+    }
+  }
+  else if (bits_per_pixel >= 10 && bits_per_pixel <= 16) { // uint16_t
+    for (int y=yb; y<=yt; y+=1) {
+      for (int x=xl; x<=xr; x+=1) {
+        const int x4 = x<<2;
+        const int basealpha = alpha[x4+0];
+        if (basealpha != 256) {
+          reinterpret_cast<uint16_t *>(buf)[x] = (uint16_t)((reinterpret_cast<uint16_t *>(buf)[x] * basealpha + ((int)alpha[x4 + 3] << (bits_per_pixel-8))) >> 8);
+        }
+      }
+      buf += pitch;
+      alpha += w4;
+    }
+  }
+  else if (bits_per_pixel == 32) { // float assume 0..1.0 scale
+    for (int y=yb; y<=yt; y+=1) {
+      for (int x=xl; x<=xr; x+=1) {
+        const int x4 = x<<2;
+        const int basealpha = alpha[x4+0];
+        if (basealpha != 256) {
+          reinterpret_cast<float *>(buf)[x] = reinterpret_cast<float *>(buf)[x] * basealpha / 256.0f + alpha[x4 + 3] / 65536.0f;
+        }
+      }
+      buf += pitch;
+      alpha += w4;
+    }
+  }
+
+  if (!bufU) return;
+
+  // This will not be fast, but it will be generic.
+  const int skipThresh = 256 << (shiftX+shiftY);
+  const int shifter = 8+shiftX+shiftY;
+  const int UVw4 = w<<(2+shiftY);
+  const int xlshiftX = xl>>shiftX;
+
+  alpha = alpha_calcs + yb*w4;
+  bufU += (pitchUV*yb)>>shiftY;
+  bufV += (pitchUV*yb)>>shiftY;
+
+  // different paths for different bitdepth
+  if(bits_per_pixel == 8) {
+    for (int y=yb; y<=yt; y+=stepY) {
+      for (int x=xl, xs=xlshiftX; x<=xr; x+=stepX, xs+=1) {
+        unsigned short* UValpha = alpha + x*4;
+        int basealphaUV = 0;
+        int au = 0;
+        int av = 0;
+        for (int i = 0; i<stepY; i++) {
+          for (int j = 0; j<stepX; j++) {
+            basealphaUV += UValpha[0 + j*4];
+            av          += UValpha[1 + j*4];
+            au          += UValpha[2 + j*4];
+          }
+          UValpha += w4;
+        }
+        if (basealphaUV != skipThresh) {
+          bufU[xs] = BYTE((bufU[xs] * basealphaUV + au) >> shifter);
+          bufV[xs] = BYTE((bufV[xs] * basealphaUV + av) >> shifter);
+        }
+      }// end for x
+      bufU  += pitchUV;
+      bufV  += pitchUV;
+      alpha += UVw4;
+    }//end for y
+  }
+  else if (bits_per_pixel >= 10 && bits_per_pixel <= 16) { // uint16_t
+    for (int y=yb; y<=yt; y+=stepY) {
+      for (int x=xl, xs=xlshiftX; x<=xr; x+=stepX, xs+=1) {
+        unsigned short* UValpha = alpha + x*4;
+        int basealphaUV = 0;
+        int au = 0;
+        int av = 0;
+        for (int i = 0; i<stepY; i++) {
+          for (int j = 0; j<stepX; j++) {
+            basealphaUV += UValpha[0 + j*4];
+            av          += UValpha[1 + j*4];
+            au          += UValpha[2 + j*4];
+          }
+          UValpha += w4;
+        }
+        if (basealphaUV != skipThresh) {
+          reinterpret_cast<uint16_t *>(bufU)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufU)[xs] * basealphaUV + (au << (bits_per_pixel-8))) >> shifter);
+          reinterpret_cast<uint16_t *>(bufV)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufV)[xs] * basealphaUV + (av << (bits_per_pixel-8))) >> shifter);
+        }
+      }// end for x
+      bufU  += pitchUV;
+      bufV  += pitchUV;
+      alpha += UVw4;
+    }//end for y
+  }
+  else if (bits_per_pixel == 32) { // float. assume 0..1.0 scale
+    const float shifter_inv_f = 1.0f / (1 << shifter);
+    const float a_factor = shifter_inv_f / 256.0f;
+    for (int y=yb; y<=yt; y+=stepY) {
+      for (int x=xl, xs=xlshiftX; x<=xr; x+=stepX, xs+=1) {
+        unsigned short* UValpha = alpha + x*4;
+        int basealphaUV = 0;
+        int au = 0;
+        int av = 0;
+        for (int i = 0; i<stepY; i++) {
+          for (int j = 0; j<stepX; j++) {
+            basealphaUV += UValpha[0 + j*4];
+            av          += UValpha[1 + j*4];
+            au          += UValpha[2 + j*4];
+          }
+          UValpha += w4;
+        }
+        if (basealphaUV != skipThresh) {
+          const float basealphaUV_f = (float)basealphaUV * shifter_inv_f;
+          reinterpret_cast<float *>(bufU)[xs] = reinterpret_cast<float *>(bufU)[xs] * basealphaUV_f + au * a_factor;
+          reinterpret_cast<float *>(bufV)[xs] = reinterpret_cast<float *>(bufV)[xs] * basealphaUV_f + av * a_factor;
+        }
+      }// end for x
+      bufU  += pitchUV;
+      bufV  += pitchUV;
+      alpha += UVw4;
+    }//end for y
+  }
+}
+
+void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE* bufV, int shiftX, int shiftY, int bits_per_pixel) {
+  const int stepX = 1 << shiftX;
+  const int stepY = 1 << shiftY;
+
+  switch (bits_per_pixel) {
+  case 8:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 8>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 8>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 8>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  case 10:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 10>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 10>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 10>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  case 12:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 12>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 12>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 12>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  case 14:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 14>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 14>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 14>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  case 16:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 16>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 16>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 16>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  case 32:
+    if (shiftX == 0 && shiftY == 0) {
+      ApplyPlanar_core<0, 0, 32>(buf, pitch, pitchUV, bufU, bufV); // 4:4:4
+      return;
+    }
+    else if (shiftX == 0 && shiftY == 1) {
+      ApplyPlanar_core<0, 1, 32>(buf, pitch, pitchUV, bufU, bufV); // 4:2:2
+      return;
+    }
+    else if (shiftX == 1 && shiftY == 1) {
+      ApplyPlanar_core<1, 1, 32>(buf, pitch, pitchUV, bufU, bufV); // 4:2:0
+      return;
+    }
+    break;
+  }
+  // keep old path for for any nonstandard surprise
+
+  if (dirty) {
+    GetAlphaRect();
+    xl &= -stepX; xr |= stepX-1;
+    yb &= -stepY; yt |= stepY-1;
+  }
+  const int w4 = w*4;
+  unsigned short* alpha = alpha_calcs + yb*w4;
+  buf += pitch*yb;
+
+  // Apply Y
+  // different paths for different bitdepth
+  // todo PF 161208 shiftX shiftY bits_per_pixel templates
+  // perpaps int->byte, short (faster??)
+  if(bits_per_pixel == 8) {
       for (int y=yb; y<=yt; y+=1) {
           for (int x=xl; x<=xr; x+=1) {
               const int x4 = x<<2;
@@ -277,13 +520,13 @@ void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYT
           alpha += w4;
       }
   }
-  else if (pixelsize == 2) { // uint16_t
+  else if (bits_per_pixel >= 10 && bits_per_pixel <= 16) { // uint16_t
       for (int y=yb; y<=yt; y+=1) {
           for (int x=xl; x<=xr; x+=1) {
               const int x4 = x<<2;
               const int basealpha = alpha[x4+0];
               if (basealpha != 256) {
-                  reinterpret_cast<uint16_t *>(buf)[x] = (uint16_t)((reinterpret_cast<uint16_t *>(buf)[x] * basealpha + ((int)alpha[x4 + 3] << 8)) >> 8);
+                  reinterpret_cast<uint16_t *>(buf)[x] = (uint16_t)((reinterpret_cast<uint16_t *>(buf)[x] * basealpha + ((int)alpha[x4 + 3] << (bits_per_pixel-8))) >> 8);
               }
           }
           buf += pitch;
@@ -317,7 +560,7 @@ void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYT
   bufV += (pitchUV*yb)>>shiftY;
 
   // different paths for different bitdepth
-  if(pixelsize == 1) {
+  if(bits_per_pixel == 8) {
       for (int y=yb; y<=yt; y+=stepY) {
           for (int x=xl, xs=xlshiftX; x<=xr; x+=stepX, xs+=1) {
               unsigned short* UValpha = alpha + x*4;
@@ -342,7 +585,7 @@ void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYT
           alpha += UVw4;
       }//end for y
   }
-  else if (pixelsize == 2) { // uint16_t
+  else if (bits_per_pixel >= 10 && bits_per_pixel <= 16) { // uint16_t
       for (int y=yb; y<=yt; y+=stepY) {
           for (int x=xl, xs=xlshiftX; x<=xr; x+=stepX, xs+=1) {
               unsigned short* UValpha = alpha + x*4;
@@ -358,8 +601,8 @@ void Antialiaser::ApplyPlanar(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYT
                   UValpha += w4;
               }
               if (basealphaUV != skipThresh) {
-                  reinterpret_cast<uint16_t *>(bufU)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufU)[xs] * basealphaUV + (au << 8)) >> shifter);
-                  reinterpret_cast<uint16_t *>(bufV)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufV)[xs] * basealphaUV + (av << 8)) >> shifter);
+                  reinterpret_cast<uint16_t *>(bufU)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufU)[xs] * basealphaUV + (au << (bits_per_pixel-8))) >> shifter);
+                  reinterpret_cast<uint16_t *>(bufV)[xs] = (uint16_t)((reinterpret_cast<uint16_t *>(bufV)[xs] * basealphaUV + (av << (bits_per_pixel-8))) >> shifter);
               }
           }// end for x
           bufU  += pitchUV;
@@ -573,10 +816,29 @@ void Antialiaser::GetAlphaRect()
           tmp |= *reinterpret_cast<int*>(src + srcpitch*i - 1);
         }
       } else {
+#if 0
 #pragma unroll
+
         for (int i = -12; i < 20; ++i) {
           tmp |= *reinterpret_cast<int*>(src + srcpitch*i - 1);
         }
+#else
+        BYTE *tmpsrc = src + srcpitch*(-12) - 1;
+#pragma unroll
+        // PF 161208 speedup test manual unroll, no pragma in VS
+        for (int i = -12; i < 20; i+=4) { // 0..31
+          tmp |= *reinterpret_cast<int*>(tmpsrc) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*1) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*2) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*3)/* |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*4) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*5) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*6) |
+            *reinterpret_cast<int*>(tmpsrc+srcpitch*7)*/
+            ;
+          tmpsrc += srcpitch*4;
+        }
+#endif
       }
 
       tmp &= 0x00FFFFFF;
@@ -685,6 +947,20 @@ void Antialiaser::GetAlphaRect()
               BYTE hmasks[8], mask;
 
               mask = cenmask;
+#if 1
+              { // PF 161208 speedup test get first two bytes as word
+                int index = srcpitch*(0 + 8);
+                for (int i = 0; i < 8; i++) {
+                  // Check the 3 cells above
+                  const uint16_t ab = *reinterpret_cast<uint16_t *>(src + index - 1);
+                  mask |= bitexr[ab & 0xFF];
+                  mask |= -!!(ab >> 8);
+                  mask |= bitexl[src[index + 1]];
+                  hmasks[i] = mask;
+                  index += srcpitch;
+                }
+              }
+#else
               for(i=0; i<8; i++) {
                 // Check the 3 cells above
                 mask |= bitexr[ src[srcpitch*(i+8)-1] ];
@@ -692,16 +968,33 @@ void Antialiaser::GetAlphaRect()
                 mask |= bitexl[ src[srcpitch*(i+8)+1] ];
                 hmasks[i] = mask;
               }
+#endif
 
               mask = cenmask;
-              for(i=7; i>=0; i--) {
+#if 1
+              { // PF 161208 speedup test get first two bytes as word
+                int index = srcpitch*(7 - 8);
+                for (int i = 7; i >= 0; i--) {
+                  // Check the 3 cells below
+                  const uint16_t ab = *reinterpret_cast<uint16_t *>(src + index - 1);
+                  mask |= bitexr[ab & 0xFF];
+                  mask |= -!!(ab >> 8);
+                  mask |= bitexl[src[index + 1]];
+                  alpha2 += bitcnt[hmasks[i] | mask];
+                  index -= srcpitch;
+                }
+              }
+#else
+              for (i = 7; i >= 0; i--) {
                 // Check the 3 cells below
-                mask |= bitexr[ src[srcpitch*(i-8)-1] ];
-                mask |=    - !! src[srcpitch*(i-8)  ];
-                mask |= bitexl[ src[srcpitch*(i-8)+1] ];
+                mask |= bitexr[src[srcpitch*(i - 8) - 1]];
+                mask |= -!!src[srcpitch*(i - 8)];
+                mask |= bitexl[src[srcpitch*(i - 8) + 1]];
 
                 alpha2 += bitcnt[hmasks[i] | mask];
               }
+            }
+#endif
               alpha2 *=2;
             }
           }
@@ -747,8 +1040,8 @@ ShowFrameNumber::ShowFrameNumber(PClip _child, bool _scroll, int _offset, int _x
 					 int _size, int _textcolor, int _halocolor, int font_width, int font_angle, IScriptEnvironment* env)
  : GenericVideoFilter(_child), scroll(_scroll), offset(_offset), x(_x), y(_y), size(_size),
    antialiaser(vi.width, vi.height, _fontname, _size,
-               vi.IsYUV() ? RGB2YUV(_textcolor) : _textcolor,
-               vi.IsYUV() ? RGB2YUV(_halocolor) : _halocolor,
+               vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_textcolor) : _textcolor,
+               vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_halocolor) : _halocolor,
 			   font_width, font_angle)
 {
 }
@@ -827,8 +1120,8 @@ ShowSMPTE::ShowSMPTE(PClip _child, double _rate, const char* offset, int _offset
 					 int _size, int _textcolor, int _halocolor, int font_width, int font_angle, IScriptEnvironment* env)
   : GenericVideoFilter(_child), x(_x), y(_y),
     antialiaser(vi.width, vi.height, _fontname, _size,
-                vi.IsYUV() ? RGB2YUV(_textcolor) : _textcolor,
-                vi.IsYUV() ? RGB2YUV(_halocolor) : _halocolor,
+                vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_textcolor) : _textcolor,
+                vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_halocolor) : _halocolor,
 			    font_width, font_angle)
 {
   int off_f, off_sec, off_min, off_hour;
@@ -1020,8 +1313,8 @@ Subtitle::Subtitle( PClip _child, const char _text[], int _x, int _y, int _first
 					int _font_width, int _font_angle, bool _interlaced )
  : GenericVideoFilter(_child), antialiaser(0), text(_text), x(_x), y(_y),
    firstframe(_firstframe), lastframe(_lastframe), fontname(_fontname), size(_size),
-   textcolor(vi.IsYUV() ? RGB2YUV(_textcolor) : _textcolor),
-   halocolor(vi.IsYUV() ? RGB2YUV(_halocolor) : _halocolor),
+   textcolor(vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_textcolor) : _textcolor),
+   halocolor(vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_halocolor) : _halocolor),
    align(_align), spc(_spc), multiline(_multiline), lsp(_lsp),
    font_width(_font_width), font_angle(_font_angle), interlaced(_interlaced)
 {
@@ -1194,10 +1487,12 @@ inline int CalcFontSize(int w, int h)
  *******   FilterInfo Filter    ******
  **********************************/
 
-
-FilterInfo::FilterInfo( PClip _child)
-: GenericVideoFilter(_child), vii(AdjustVi()),
-  antialiaser(vi.width, vi.height, "Courier New", CalcFontSize(vi.width, vi.height), vi.IsYUV() ? 0xD21092 : 0xFFFF00, vi.IsYUV() ? 0x108080 : 0) {
+FilterInfo::FilterInfo( PClip _child, bool _font_override, const char _fontname[], int _size, int _textcolor, int _halocolor, IScriptEnvironment* env)
+: GenericVideoFilter(_child), vii(AdjustVi()), font_override(_font_override), size(_size),
+  antialiaser(vi.width, vi.height, _fontname, size, 
+      vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_textcolor) : _textcolor,
+      vi.IsYUV() || vi.IsYUVA() ? RGB2YUV(_halocolor) : _halocolor) 
+{
 }
 
 
@@ -1221,69 +1516,6 @@ const VideoInfo& FilterInfo::AdjustVi()
 }
 
 
-const char* const t_YV12="YV12";
-const char* const t_YUY2="YUY2";
-const char* const t_RGB32="RGB32";
-const char* const t_RGB24="RGB24";
-const char* const t_YV24="YV24";
-const char* const t_Y8="Y8";
-const char* const t_YV16="YV16";
-const char* const t_Y41P="YUV 411 Planar";
-
-const char* const t_YUV420P10="YUV420P10";
-const char* const t_YUV422P10="YUV422P10";
-const char* const t_YUV444P10="YUV444P10";
-const char* const t_Y10="Y10";
-const char* const t_YUV420P12="YUV420P12";
-const char* const t_YUV422P12="YUV422P12";
-const char* const t_YUV444P12="YUV444P12";
-const char* const t_Y12="Y12";
-const char* const t_YUV420P14="YUV420P14";
-const char* const t_YUV422P14="YUV422P14";
-const char* const t_YUV444P14="YUV444P14";
-const char* const t_Y14="Y14";
-const char* const t_YUV420P16="YUV420P16";
-const char* const t_YUV422P16="YUV422P16";
-const char* const t_YUV444P16="YUV444P16";
-const char* const t_Y16="Y16";
-const char* const t_YUV420PS="YUV420PS";
-const char* const t_YUV422PS="YUV422PS";
-const char* const t_YUV444PS="YUV444PS";
-const char* const t_Y32="Y32";
-
-const char* const t_YUVA420P10="YUVA420P10";
-const char* const t_YUVA422P10="YUVA422P10";
-const char* const t_YUVA444P10="YUVA444P10";
-const char* const t_YUVA420P12="YUVA420P12";
-const char* const t_YUVA422P12="YUVA422P12";
-const char* const t_YUVA444P12="YUVA444P12";
-const char* const t_YUVA420P14="YUVA420P14";
-const char* const t_YUVA422P14="YUVA422P14";
-const char* const t_YUVA444P14="YUVA444P14";
-const char* const t_YUVA420P16="YUVA420P16";
-const char* const t_YUVA422P16="YUVA422P16";
-const char* const t_YUVA444P16="YUVA444P16";
-const char* const t_YUVA420PS="YUVA420PS";
-const char* const t_YUVA422PS="YUVA422PS";
-const char* const t_YUVA444PS="YUVA444PS";
-
-const char* const t_RGB48="RGB48";
-const char* const t_RGB64="RGB64";
-
-const char* const t_RGBP="RGBP";
-const char* const t_RGBP10="RGBP10";
-const char* const t_RGBP12="RGBP12";
-const char* const t_RGBP14="RGBP14";
-const char* const t_RGBP16="RGBP16";
-const char* const t_RGBPS="RGBPS";
-
-const char* const t_RGBAP="RGBAP";
-const char* const t_RGBAP10="RGBAP10";
-const char* const t_RGBAP12="RGBAP12";
-const char* const t_RGBAP14="RGBAP14";
-const char* const t_RGBAP16="RGBAP16";
-const char* const t_RGBAPS="RGBAPS";
-
 const char* const t_INT8="Integer 8 bit";
 const char* const t_INT16="Integer 16 bit";
 const char* const t_INT24="Integer 24 bit";
@@ -1300,40 +1532,73 @@ const char* const t_STFF="Top Field (Separated)      ";
 const char* const t_SBFF="Bottom Field (Separated)   ";
 
 
-std::string GetCpuMsg(IScriptEnvironment * env)
+std::string GetCpuMsg(IScriptEnvironment * env, bool avx512)
 {
   int flags = env->GetCPUFlags();
   std::stringstream ss;
 
-  if (flags & CPUF_FPU)
-    ss << "x87  ";
-  if (flags & CPUF_MMX)
-    ss << "MMX  ";
-  if (flags & CPUF_INTEGER_SSE)
-    ss << "ISSE  ";
+  if (!avx512) {
+  // don't display old capabilities when at least AVX is used
+    if (!(flags & CPUF_AVX)) {
+    //if (flags & CPUF_FPU)
+    //  ss << "x87 ";
+      if (flags & CPUF_MMX)
+        ss << "MMX ";
+      if (flags & CPUF_INTEGER_SSE)
+        ss << "ISSE ";
 
-  if (flags & CPUF_SSE4_2)
-    ss << "SSE4.2 ";
-  else if (flags & CPUF_SSE4_1)
-    ss << "SSE4.1 ";
-  else if (flags & CPUF_SSE3)
-    ss << "SSE3 ";
-  else if (flags & CPUF_SSE2)
-    ss << "SSE2 ";
-  else if (flags & CPUF_SSE)
-    ss << "SSE  ";
+      if (flags & CPUF_3DNOW_EXT)
+        ss << "3DNOW_EXT";
+      else if (flags & CPUF_3DNOW)
+        ss << "3DNOW ";
+    }
 
-  if (flags & CPUF_SSSE3)
-    ss << "SSSE3 ";
+    // from SSE..SSE4.2 display the highest
+    if (flags & CPUF_SSE4_2)
+      ss << "SSE4.2 ";
+    else if (flags & CPUF_SSE4_1)
+      ss << "SSE4.1 ";
+    else if (flags & CPUF_SSE3)
+      ss << "SSE3 ";
+    else if (flags & CPUF_SSE2)
+      ss << "SSE2 ";
+    else if (flags & CPUF_SSE)
+      ss << "SSE ";
 
-  if (flags & CPUF_AVX)
+    if (flags & CPUF_SSSE3)
+      ss << "SSSE3 ";
+
+    if (flags & CPUF_AVX)
       ss << "AVX ";
-
-  if (flags & CPUF_3DNOW_EXT)
-    ss << "3DNOW_EXT";
-  else if (flags & CPUF_3DNOW)
-    ss << "3DNOW ";
-
+    if (flags & CPUF_AVX2)
+      ss << "AVX2 ";
+    if (flags & CPUF_FMA3)
+      ss << "FMA3 ";
+    if (flags & CPUF_FMA4)
+      ss << "FMA4 ";
+    if (flags & CPUF_F16C)
+      ss << "F16C ";
+  }
+  else {
+    if (flags & CPUF_AVX512F)
+      ss << "AVX512F ";
+    if (flags & CPUF_AVX512DQ)
+      ss << "AVX512DQ ";
+    if (flags & CPUF_AVX512PF)
+      ss << "AVX512PF ";
+    if (flags & CPUF_AVX512ER)
+      ss << "AVX512ER ";
+    if (flags & CPUF_AVX512CD)
+      ss << "AVX512CD ";
+    if (flags & CPUF_AVX512BW)
+      ss << "AVX512BW ";
+    if (flags & CPUF_AVX512VL)
+      ss << "AVX512VL ";
+    if (flags & CPUF_AVX512IFMA)
+      ss << "AVX512IFMA ";
+    if (flags & CPUF_AVX512VBMI)
+      ss << "AVX512VBMI ";
+  }
   return ss.str();
 }
 
@@ -1349,7 +1614,7 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
   PVideoFrame frame = vii.HasVideo() ? child->GetFrame(n, env) : env->NewVideoFrame(vi);
 
   if ( !vii.HasVideo() ) {
-	memset(frame->GetWritePtr(), 0, frame->GetPitch()*frame->GetHeight()); // Blank frame
+    memset(frame->GetWritePtr(), 0, frame->GetPitch()*frame->GetHeight()); // Blank frame
   }
 
   HDC hdcAntialias = antialiaser.GetDC();
@@ -1357,83 +1622,26 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
     const char* c_space = "Unknown";
     const char* s_type = t_NONE;
     const char* s_parity;
-    char text[512];
-	int tlen;
-    RECT r= { 32, 16, min(3440,vi.width*8), 900*2 };
+    char text[1024];
+    int tlen;
 
     if (vii.HasVideo()) {
-      if      (vii.IsRGB24()) c_space=t_RGB24;
-      else if (vii.IsRGB32()) c_space=t_RGB32;
-      else if (vii.IsYV12())  c_space=t_YV12;
-      else if (vii.IsYUY2())  c_space=t_YUY2;
-      else if (vii.IsYV24())  c_space=t_YV24;
-      else if (vii.IsY8())    c_space=t_Y8;
-      else if (vii.IsYV16())  c_space=t_YV16;
-      else if (vii.IsYV411()) c_space=t_Y41P;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV420P10)) c_space=t_YUV420P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV422P10)) c_space=t_YUV422P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV444P10)) c_space=t_YUV444P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_Y10)) c_space=t_Y10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV420P12)) c_space=t_YUV420P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV422P12)) c_space=t_YUV422P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV444P12)) c_space=t_YUV444P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_Y12)) c_space=t_Y12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV420P14)) c_space=t_YUV420P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV422P14)) c_space=t_YUV422P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV444P14)) c_space=t_YUV444P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_Y14)) c_space=t_Y14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV420P16)) c_space=t_YUV420P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV422P16)) c_space=t_YUV422P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV444P16)) c_space=t_YUV444P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_Y16)) c_space=t_Y16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV420PS)) c_space=t_YUV420PS;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV422PS)) c_space=t_YUV422PS;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUV444PS)) c_space=t_YUV444PS;
-      else if (vii.IsColorSpace(VideoInfo::CS_Y32)) c_space=t_Y32;
-
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA420P10)) c_space=t_YUVA420P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA422P10)) c_space=t_YUVA422P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA444P10)) c_space=t_YUVA444P10;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA420P12)) c_space=t_YUVA420P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA422P12)) c_space=t_YUVA422P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA444P12)) c_space=t_YUVA444P12;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA420P14)) c_space=t_YUVA420P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA422P14)) c_space=t_YUVA422P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA444P14)) c_space=t_YUVA444P14;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA420P16)) c_space=t_YUVA420P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA422P16)) c_space=t_YUVA422P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA444P16)) c_space=t_YUVA444P16;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA420PS)) c_space=t_YUVA420PS;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA422PS)) c_space=t_YUVA422PS;
-      else if (vii.IsColorSpace(VideoInfo::CS_YUVA444PS)) c_space=t_YUVA444PS;
-
-      else if (vii.IsColorSpace(VideoInfo::CS_BGR48)) c_space=t_RGB48;
-      else if (vii.IsColorSpace(VideoInfo::CS_BGR64)) c_space=t_RGB64;
-
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBP)) c_space=t_RGBP;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBP10)) c_space=t_RGBP10;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBP12)) c_space=t_RGBP12;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBP14)) c_space=t_RGBP14;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBP16)) c_space=t_RGBP16;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBPS)) c_space=t_RGBPS;
-
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAP)) c_space=t_RGBAP;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAP10)) c_space=t_RGBAP10;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAP12)) c_space=t_RGBAP12;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAP14)) c_space=t_RGBAP14;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAP16)) c_space=t_RGBAP16;
-      else if (vii.IsColorSpace(VideoInfo::CS_RGBAPS)) c_space=t_RGBAPS;
-
+      c_space = GetPixelTypeName(vii.pixel_type);
+      if (*c_space == '\0')
+        c_space = "Unknown";
       if (vii.IsFieldBased()) {
         if (child->GetParity(n)) {
           s_parity = t_STFF;
-        } else {
+        }
+        else {
           s_parity = t_SBFF;
         }
-      } else {
+      }
+      else {
         if (child->GetParity(n)) {
           s_parity = vii.IsTFF() ? t_ATFF : t_TFF;
-        } else {
+        }
+        else {
           s_parity = vii.IsBFF() ? t_ABFF : t_BFF;
         }
       }
@@ -1443,26 +1651,27 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
       tlen = _snprintf(text, sizeof(text),
         "Frame: %8u of %-8u\n"                                //  28
         "Time: %02d:%02d:%02d.%03d of %02d:%02d:%02d.%03d\n"  //  35
-        "ColorSpace: %s\n"                                    //  18=13+5
-        "Bits per component: %2u\n"                           //  22
-        "Width:%4u pixels, Height:%4u pixels.\n"              //  39
+        "ColorSpace: %s, BitsPerComponent: %u\n"              //  18=13+5
+//        "Bits per component: %2u\n"                           //  22
+        "Width:%4u pixels, Height:%4u pixels\n"              //  39
         "Frames per second: %7.4f (%u/%u)\n"                  //  51=31+20
         "FieldBased (Separated) Video: %s\n"                  //  35=32+3
         "Parity: %s\n"                                        //  35=9+26
         "Video Pitch: %5u bytes.\n"                           //  25
         "Has Audio: %s\n"                                     //  15=12+3
-        , n, vii.num_frames
-        , (cPosInMsecs/(60*60*1000)), (cPosInMsecs/(60*1000))%60 ,(cPosInMsecs/1000)%60, cPosInMsecs%1000,
-          (vLenInMsecs/(60*60*1000)), (vLenInMsecs/(60*1000))%60 ,(vLenInMsecs/1000)%60, vLenInMsecs%1000
-        , c_space
-        , vii.BitsPerComponent()
-        , vii.width, vii.height
-        , (float)vii.fps_numerator/(float)vii.fps_denominator, vii.fps_numerator, vii.fps_denominator
-        , vii.IsFieldBased() ? t_YES : t_NO
-        , s_parity
-        , frame->GetPitch()
-        , vii.HasAudio() ? t_YES : t_NO
-      );
+//        "123456789012345678901234567890123456789012345678901234567890\n"         // test
+, n, vii.num_frames
+, (cPosInMsecs / (60 * 60 * 1000)), (cPosInMsecs / (60 * 1000)) % 60, (cPosInMsecs / 1000) % 60, cPosInMsecs % 1000,
+(vLenInMsecs / (60 * 60 * 1000)), (vLenInMsecs / (60 * 1000)) % 60, (vLenInMsecs / 1000) % 60, vLenInMsecs % 1000
+, c_space
+, vii.BitsPerComponent()
+, vii.width, vii.height
+, (float)vii.fps_numerator / (float)vii.fps_denominator, vii.fps_numerator, vii.fps_denominator
+, vii.IsFieldBased() ? t_YES : t_NO
+, s_parity
+, frame->GetPitch()
+, vii.HasAudio() ? t_YES : t_NO
+);
     }
     else {
       tlen = _snprintf(text, sizeof(text),
@@ -1474,38 +1683,92 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
       );
     }
     if (vii.HasAudio()) {
-      if      (vii.SampleType()==SAMPLE_INT8)  s_type=t_INT8;
-      else if (vii.SampleType()==SAMPLE_INT16) s_type=t_INT16;
-      else if (vii.SampleType()==SAMPLE_INT24) s_type=t_INT24;
-      else if (vii.SampleType()==SAMPLE_INT32) s_type=t_INT32;
-      else if (vii.SampleType()==SAMPLE_FLOAT) s_type=t_FLOAT32;
+      if (vii.SampleType() == SAMPLE_INT8)  s_type = t_INT8;
+      else if (vii.SampleType() == SAMPLE_INT16) s_type = t_INT16;
+      else if (vii.SampleType() == SAMPLE_INT24) s_type = t_INT24;
+      else if (vii.SampleType() == SAMPLE_INT32) s_type = t_INT32;
+      else if (vii.SampleType() == SAMPLE_FLOAT) s_type = t_FLOAT32;
 
       int aLenInMsecs = (int)(1000.0 * (double)vii.num_audio_samples / (double)vii.audio_samples_per_second);
-	  tlen += _snprintf(text+tlen, sizeof(text)-tlen,
-		"Audio Channels: %-8u\n"                              //  25
-		"Sample Type: %s\n"                                   //  28=14+14
-		"Samples Per Second: %5d\n"                           //  26
-		"Audio length: %I64u samples. %02d:%02d:%02d.%03d\n"  //  57=37+20
-		, vii.AudioChannels()
-		, s_type
-		, vii.audio_samples_per_second
-		, vii.num_audio_samples,
-		  (aLenInMsecs/(60*60*1000)), (aLenInMsecs/(60*1000))%60, (aLenInMsecs/1000)%60, aLenInMsecs%1000
-	  );
+      tlen += _snprintf(text + tlen, sizeof(text) - tlen,
+        "Audio Channels: %-8u\n"                              //  25
+        "Sample Type: %s\n"                                   //  28=14+14
+        "Samples Per Second: %5d\n"                           //  26
+        "Audio length: %I64u samples. %02d:%02d:%02d.%03d\n"  //  57=37+20
+        , vii.AudioChannels()
+        , s_type
+        , vii.audio_samples_per_second
+        , vii.num_audio_samples,
+        (aLenInMsecs / (60 * 60 * 1000)), (aLenInMsecs / (60 * 1000)) % 60, (aLenInMsecs / 1000) % 60, aLenInMsecs % 1000
+      );
     }
-	else {
-	  strcpy(text+tlen,"\n");
-	  tlen += 1;
-	}
-    tlen += _snprintf(text+tlen, sizeof(text)-tlen,
-      "CPU detected: %s\n"                                  //  60=15+45
-      , GetCpuMsg(env).c_str()                              // 442
+    else {
+      strcpy(text + tlen, "\n");
+      tlen += 1;
+    }
+    // CPU capabilities w/o AVX512
+    tlen += _snprintf(text + tlen, sizeof(text) - tlen,
+      "CPU: %s\n"
+      , GetCpuMsg(env, false).c_str()
     );
+    // AVX512 flags in new line (too long)
+    std::string avx512 = GetCpuMsg(env, true);
+    if (avx512.length() > 0) {
+      tlen += _snprintf(text + tlen, sizeof(text) - tlen,
+        "     %s\n"
+        , avx512.c_str()
+      );
+    }
 
+    // So far RECT dimensions were hardcoded: RECT r = { 32, 16, min(3440,vi.width * 8), 900*2 }; 
+    // More flexible way: get text extent
+    RECT r;
+
+#if 0
+    if(false && !font_override) 
+    {
+        // To prevent slowish full MxN rendering, we calculate a dummy 
+        // 1xN sized vertical and a Mx1 sized horizontal line extent
+        // Assuming that we are using fixed font (e.g. default Courier New)
+        std::string s = text;
+        size_t n = std::count(s.begin(), s.end(), '\n');
+        // create dummy vertical string
+        std::string s_vert;
+        for (size_t i=0; i<n; i++) s_vert += " \n";
+        RECT r0_v = { 0, 0, 100, 100 }; 
+        DrawText(hdcAntialias, s_vert.c_str(), -1, &r0_v, DT_CALCRECT);
+        // create dummy horizontal 
+        int counter = 0; int max_line = -1;
+        int len = s.length();
+        for (int i = 0; i < len; i++) // get length of longest line
+        {
+            if(s[i] != '\n') counter++;
+            if(s[i] == '\n' || i == len - 1) {
+                if(counter > max_line) max_line = counter;
+                counter = 0;
+            }
+        }
+        std::string s_horiz = std::string(max_line > 0 ? max_line : 1, ' '); // M*spaces
+        RECT r0_h = { 0, 0, 100, 100 }; // for output
+        DrawText(hdcAntialias, s_horiz.c_str(), -1, &r0_h, DT_CALCRECT);
+        // and use the width and height dimensions from the two results
+        r = { 32, 16, min(32+(int)r0_h.right,vi.width * 8-1), min(16+int(r0_v.bottom), vi.height*8-1) }; // do not crop if larger font is used
+    } else 
+#endif
+    {
+        // font was overridden, may not be fixed type
+        RECT r0 = { 0, 0, 100, 100 }; // do not crop if larger font is used
+        DrawText(hdcAntialias, text, -1, &r0, DT_CALCRECT);
+        r = { 32, 16, min(32+(int)r0.right,vi.width * 8 -1), min(16+int(r0.bottom), vi.height*8-1) }; 
+    }
+   
+    // RECT r = { 32, 16, min(3440,vi.width * 8), 900*2 }; 
+    // original code. Values possibly experimented Courier New size 18 + knowing max. text length/line count
+    
     DrawText(hdcAntialias, text, -1, &r, 0);
     GdiFlush();
 
-	env->MakeWritable(&frame);
+    env->MakeWritable(&frame);
     frame->GetWritePtr(); // Bump sequence_number
     int dst_pitch = frame->GetPitch();
     antialiaser.Apply(vi, &frame, dst_pitch );
@@ -1516,16 +1779,20 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl FilterInfo::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+    // 0   1      2       3             4       
+    // c[font]s[size]f[text_color]i[halo_color]i
     PClip clip = args[0].AsClip();
-    return new FilterInfo(clip);
+    // new parameters 20160823
+    const char* font = args[1].AsString("Courier New");
+    int size = int(args[2].AsFloat(0) * 8 + 0.5);
+    if (!args[2].Defined()) 
+        size = CalcFontSize(clip->GetVideoInfo().width, clip->GetVideoInfo().height);
+    const int text_color = args[3].AsInt(0xFFFF00);
+    const int halo_color = args[4].AsInt(0);
+
+    return new FilterInfo(clip, args[1].Defined(), font, size, text_color, halo_color, env);
+    //return new FilterInfo(clip);
 }
-
-
-
-
-
-
-
 
 
 
@@ -2346,7 +2613,7 @@ bool GetTextBoundingBox( const char* text, const char* fontname, int size, bool 
 void ApplyMessage( PVideoFrame* frame, const VideoInfo& vi, const char* message, int size,
                    int textcolor, int halocolor, int bgcolor, IScriptEnvironment* env )
 {
-  if (vi.IsYUV()) {
+  if (vi.IsYUV() || vi.IsYUVA()) {
     textcolor = RGB2YUV(textcolor);
     halocolor = RGB2YUV(halocolor);
   }

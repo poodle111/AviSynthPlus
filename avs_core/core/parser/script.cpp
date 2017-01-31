@@ -47,6 +47,8 @@
 #include "../internal.h"
 #include "../Prefetcher.h"
 #include "../InternalEnvironment.h"
+#include <map>
+
 
 
 /********************************************************************
@@ -129,6 +131,7 @@ extern const AVSFunction Script_functions[] = {
   { "rightstr", BUILTIN_FUNC_PREFIX, "si",RightStr},
   { "findstr",  BUILTIN_FUNC_PREFIX, "ss",FindStr},
   { "fillstr",  BUILTIN_FUNC_PREFIX, "i[]s",FillStr},
+  { "replacestr", BUILTIN_FUNC_PREFIX, "sss",ReplaceStr}, // avs+ 161230
 
   { "strcmp",   BUILTIN_FUNC_PREFIX, "ss",StrCmp},
   { "strcmpi",  BUILTIN_FUNC_PREFIX, "ss",StrCmpi},
@@ -246,7 +249,23 @@ extern const AVSFunction Script_functions[] = {
   { "IsYUVA",       BUILTIN_FUNC_PREFIX, "c", IsYUVA },
   { "IsPlanarRGB",  BUILTIN_FUNC_PREFIX, "c", IsPlanarRGB },
   { "IsPlanarRGBA", BUILTIN_FUNC_PREFIX, "c", IsPlanarRGBA },
+  { "ColorSpaceNameToPixelType",  BUILTIN_FUNC_PREFIX, "s", ColorSpaceNameToPixelType },
+  { "NumComponents", BUILTIN_FUNC_PREFIX, "c", NumComponents }, // r2348+
+  { "HasAlpha", BUILTIN_FUNC_PREFIX, "c", HasAlpha }, // r2348+
+  { "IsPackedRGB", BUILTIN_FUNC_PREFIX, "c", IsPackedRGB }, // r2348+
 
+#ifdef NEW_AVSVALUE
+  { "Array", BUILTIN_FUNC_PREFIX, ".+", ArrayCreate },  // # instead of +: creates script array
+  { "IsArray",   BUILTIN_FUNC_PREFIX, ".", IsArray },
+  { "ArrayGet",  BUILTIN_FUNC_PREFIX, "as", ArrayGet },
+  { "ArrayGet",  BUILTIN_FUNC_PREFIX, "a.+", ArrayGet }, // multidimensional
+  { "ArraySize", BUILTIN_FUNC_PREFIX, "a", ArraySize },
+  /*
+  { "ArrayAdd",  BUILTIN_FUNC_PREFIX, ".i*", ArrayAdd },
+  { "ArrayDel",  BUILTIN_FUNC_PREFIX, ".i", ArrayDel },
+  { "ArrayIns",  BUILTIN_FUNC_PREFIX, ".i", ArrayDel },
+  */
+#endif
   { 0 }
 };
 
@@ -606,6 +625,51 @@ AVSValue RightStr(AVSValue args, void*, IScriptEnvironment* env)
    return ret;
  }
 
+AVSValue ReplaceStr(AVSValue args, void*, IScriptEnvironment* env) {
+  char const * const original = args[0].AsString();
+  char const * const pattern = args[1].AsString();
+  char const * const replacement = args[2].AsString();
+    
+  const size_t replace_len = strlen(replacement);
+  const size_t pattern_len = strlen(pattern);
+  const size_t orig_len = strlen(original);
+
+  size_t pattern_count = 0;
+  const char * orig_ptr;
+  const char * pattern_location;
+
+  // find how many times the pattern occurs in the original string
+  for (orig_ptr = original; pattern_location = strstr(orig_ptr, pattern); orig_ptr = pattern_location + pattern_len)
+  {
+    pattern_count++;
+  }
+
+  // allocate memory for the new string
+  size_t const retlen = orig_len + pattern_count * (replace_len - pattern_len);
+  char *result = new(std::nothrow) char[sizeof(char) * (retlen + 1)];
+  if (!result) env->ThrowError("ReplaceStr: malloc failure!");
+  *result = 0;
+
+  // copy the original string, 
+  // replacing all the instances of the pattern
+  char * result_ptr = result;
+  for (orig_ptr = original; pattern_location = strstr(orig_ptr, pattern); orig_ptr = pattern_location + pattern_len)
+  {
+    const size_t skiplen = pattern_location - orig_ptr;
+    // copy the section until the occurence of the pattern
+    strncpy(result_ptr, orig_ptr, skiplen);
+    result_ptr += skiplen;
+    // copy the replacement 
+    strncpy(result_ptr, replacement, replace_len);
+    result_ptr += replace_len;
+  }
+  // copy rest
+  strcpy(result_ptr, orig_ptr);
+  AVSValue ret = env->SaveString(result);
+  delete[] result;
+  return ret;
+}
+
 AVSValue StrCmp(AVSValue args, void*, IScriptEnvironment* env)
 {
   return lstrcmp( args[0].AsString(), args[1].AsString() );
@@ -821,59 +885,129 @@ AVSValue Spline(AVSValue args, void*, IScriptEnvironment* env )
 
 static inline const VideoInfo& VI(const AVSValue& arg) { return arg.AsClip()->GetVideoInfo(); }
 
-AVSValue PixelType (AVSValue args, void*, IScriptEnvironment* env) {
-  switch (VI(args[0]).pixel_type) {
-    case VideoInfo::CS_BGR24 :
-	  return "RGB24";
-    case VideoInfo::CS_BGR32 :
-	  return "RGB32";
-    case VideoInfo::CS_YUY2  :
-	  return "YUY2";
-    case VideoInfo::CS_YV24  :
-	  return "YV24";
-    case VideoInfo::CS_YV16  :
-	  return "YV16";
-    case VideoInfo::CS_YV12  :
-    case VideoInfo::CS_I420  :
-	  return "YV12";
-    case VideoInfo::CS_YUV9  :
-	  return "YUV9";
-    case VideoInfo::CS_YV411 :
-	  return "YV411";
-    case VideoInfo::CS_Y8    :
-	  return "Y8";
-    case VideoInfo::CS_YUV420P10 :    return "YUV420P10";
-    case VideoInfo::CS_YUV422P10 :    return "YUV422P10";
-    case VideoInfo::CS_YUV444P10 :    return "YUV444P10";
-    case VideoInfo::CS_Y10       :    return "Y10";
-    case VideoInfo::CS_YUV420P12 :    return "YUV420P12";
-    case VideoInfo::CS_YUV422P12 :    return "YUV422P12";
-    case VideoInfo::CS_YUV444P12 :    return "YUV444P12";
-    case VideoInfo::CS_Y12       :    return "Y12";
-    case VideoInfo::CS_YUV420P14 :    return "YUV420P14";
-    case VideoInfo::CS_YUV422P14 :    return "YUV422P14";
-    case VideoInfo::CS_YUV444P14 :    return "YUV444P14";
-    case VideoInfo::CS_Y14       :    return "Y14";
-    case VideoInfo::CS_YUV420P16 :    return "YUV420P16";
-    case VideoInfo::CS_YUV422P16 :    return "YUV422P16";
-    case VideoInfo::CS_YUV444P16 :    return "YUV444P16";
-    case VideoInfo::CS_Y16       :    return "Y16";
-    case VideoInfo::CS_YUV420PS  :    return "YUV420PS";
-    case VideoInfo::CS_YUV422PS  :    return "YUV422PS";
-    case VideoInfo::CS_YUV444PS  :    return "YUV444PS";
-    case VideoInfo::CS_Y32       :    return "Y32";
-    case VideoInfo::CS_BGR48     :    return "RGB48";
-    case VideoInfo::CS_BGR64     :    return "RGB64";
-    case VideoInfo::CS_RGBP      :    return "RGBP";
-    case VideoInfo::CS_RGBP10    :    return "RGBP10";
-    case VideoInfo::CS_RGBP12    :    return "RGBP12";
-    case VideoInfo::CS_RGBP14    :    return "RGBP14";
-    case VideoInfo::CS_RGBP16    :    return "RGBP16";
-    case VideoInfo::CS_RGBPS     :    return "RGBPS";
-    default:
-	  break;
+static const std::map<int, std::string> pixel_format_table = 
+{ // names for lookup by pixel_type or name
+  {VideoInfo::CS_BGR24, "RGB24"},
+  {VideoInfo::CS_BGR32, "RGB32"},
+  {VideoInfo::CS_YUY2 , "YUY2"},
+  {VideoInfo::CS_YV24 , "YV24"},
+  {VideoInfo::CS_YV16 , "YV16"},
+  {VideoInfo::CS_YV12 , "YV12"},
+  {VideoInfo::CS_I420 , "YV12"},
+  {VideoInfo::CS_YUV9 , "YUV9"},
+  {VideoInfo::CS_YV411, "YV411"},
+  {VideoInfo::CS_Y8   , "Y8"},
+
+  {VideoInfo::CS_YUV420P10, "YUV420P10"},
+  {VideoInfo::CS_YUV422P10, "YUV422P10"},
+  {VideoInfo::CS_YUV444P10, "YUV444P10"},
+  {VideoInfo::CS_Y10      , "Y10"},
+  {VideoInfo::CS_YUV420P12, "YUV420P12"},
+  {VideoInfo::CS_YUV422P12, "YUV422P12"},
+  {VideoInfo::CS_YUV444P12, "YUV444P12"},
+  {VideoInfo::CS_Y12      , "Y12"},
+  {VideoInfo::CS_YUV420P14, "YUV420P14"},
+  {VideoInfo::CS_YUV422P14, "YUV422P14"},
+  {VideoInfo::CS_YUV444P14, "YUV444P14"},
+  {VideoInfo::CS_Y14      , "Y14"},
+  {VideoInfo::CS_YUV420P16, "YUV420P16"},
+  {VideoInfo::CS_YUV422P16, "YUV422P16"},
+  {VideoInfo::CS_YUV444P16, "YUV444P16"},
+  {VideoInfo::CS_Y16      , "Y16"},
+  {VideoInfo::CS_YUV420PS , "YUV420PS"},
+  {VideoInfo::CS_YUV422PS , "YUV422PS"},
+  {VideoInfo::CS_YUV444PS , "YUV444PS"},
+  {VideoInfo::CS_Y32      , "Y32"},
+
+  {VideoInfo::CS_BGR48    , "RGB48"},
+  {VideoInfo::CS_BGR64    , "RGB64"},
+
+  {VideoInfo::CS_RGBP     , "RGBP"},
+  {VideoInfo::CS_RGBP10   , "RGBP10"},
+  {VideoInfo::CS_RGBP12   , "RGBP12"},
+  {VideoInfo::CS_RGBP14   , "RGBP14"},
+  {VideoInfo::CS_RGBP16   , "RGBP16"},
+  {VideoInfo::CS_RGBPS    , "RGBPS"},
+
+  {VideoInfo::CS_YUVA420, "YUVA420"},
+  {VideoInfo::CS_YUVA422, "YUVA422"},
+  {VideoInfo::CS_YUVA444, "YUVA444"},
+  {VideoInfo::CS_YUVA420P10, "YUVA420P10"},
+  {VideoInfo::CS_YUVA422P10, "YUVA422P10"},
+  {VideoInfo::CS_YUVA444P10, "YUVA444P10"},
+  {VideoInfo::CS_YUVA420P12, "YUVA420P12"},
+  {VideoInfo::CS_YUVA422P12, "YUVA422P12"},
+  {VideoInfo::CS_YUVA444P12, "YUVA444P12"},
+  {VideoInfo::CS_YUVA420P14, "YUVA420P14"},
+  {VideoInfo::CS_YUVA422P14, "YUVA422P14"},
+  {VideoInfo::CS_YUVA444P14, "YUVA444P14"},
+  {VideoInfo::CS_YUVA420P16, "YUVA420P16"},
+  {VideoInfo::CS_YUVA422P16, "YUVA422P16"},
+  {VideoInfo::CS_YUVA444P16, "YUVA444P16"},
+  {VideoInfo::CS_YUVA420PS , "YUVA420PS"},
+  {VideoInfo::CS_YUVA422PS , "YUVA422PS"},
+  {VideoInfo::CS_YUVA444PS , "YUVA444PS"},
+
+  {VideoInfo::CS_RGBAP     , "RGBAP"},
+  {VideoInfo::CS_RGBAP10   , "RGBAP10"},
+  {VideoInfo::CS_RGBAP12   , "RGBAP12"},
+  {VideoInfo::CS_RGBAP14   , "RGBAP14"},
+  {VideoInfo::CS_RGBAP16   , "RGBAP16"},
+  {VideoInfo::CS_RGBAPS    , "RGBAPS"},
+};
+
+static const std::multimap<int, std::string> pixel_format_table_ex = 
+{ // alternative names for lookup by name (multimap!)
+  {VideoInfo::CS_YV24 , "YUV444"},
+  {VideoInfo::CS_YV16 , "YUV422"},
+  {VideoInfo::CS_YV12 , "YUV420"},
+  {VideoInfo::CS_YV411, "YUV411"},
+  {VideoInfo::CS_RGBP , "RGBP8"},
+  {VideoInfo::CS_RGBAP, "RGBAP8"},
+  {VideoInfo::CS_YV24 , "YUV444P8"},
+  {VideoInfo::CS_YV16 , "YUV422P8"},
+  {VideoInfo::CS_YV12 , "YUV420P8"},
+  {VideoInfo::CS_YV411, "YUV411P8"},
+  {VideoInfo::CS_YUVA420, "YUVA420P8"},
+  {VideoInfo::CS_YUVA422, "YUVA422P8"},
+  {VideoInfo::CS_YUVA444, "YUVA444P8"},
+};
+
+const char *GetPixelTypeName(const int pixel_type)
+{
+  const std::string name = "";
+  auto it = pixel_format_table.find(pixel_type);
+  if (it == pixel_format_table.end())
+    return "";
+  return (it->second).c_str();
+}
+
+const int GetPixelTypeFromName(const char *pixeltypename)
+{
+  std::string name_to_find = pixeltypename;
+  for (auto & c: name_to_find) c = toupper(c); // uppercase input string
+  for (auto it = pixel_format_table.begin(); it != pixel_format_table.end(); it++)
+  {
+    if ((it->second).compare(name_to_find) == 0)
+      return it->first;
   }
-  return "";
+  // find by alternative names e.g. YUV420 or YUV420P8 instead of YV12
+  for (auto it = pixel_format_table_ex.begin(); it != pixel_format_table_ex.end(); it++)
+  {
+    if ((it->second).compare(name_to_find) == 0)
+      return it->first;
+  }
+  return VideoInfo::CS_UNKNOWN;
+}
+
+
+AVSValue PixelType (AVSValue args, void*, IScriptEnvironment* env) {
+  return GetPixelTypeName(VI(args[0]).pixel_type);
+}
+
+// AVS+
+AVSValue ColorSpaceNameToPixelType (AVSValue args, void*, IScriptEnvironment* env) {
+  return GetPixelTypeFromName(args[0].AsString());
 }
 
 AVSValue Width(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).width; }
@@ -1126,4 +1260,72 @@ AVSValue BitsPerComponent(AVSValue args, void*, IScriptEnvironment* env) { retur
 AVSValue IsYUVA(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).IsYUVA(); }
 AVSValue IsPlanarRGB(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).IsPlanarRGB(); }
 AVSValue IsPlanarRGBA(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).IsPlanarRGBA(); }
+AVSValue NumComponents(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).NumComponents(); }
+AVSValue HasAlpha(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).IsPlanarRGBA() || VI(args[0]).IsYUVA() || VI(args[0]).IsRGB32() || VI(args[0]).IsRGB64(); }
+AVSValue IsPackedRGB(AVSValue args, void*, IScriptEnvironment* env) { return VI(args[0]).IsRGB24() || VI(args[0]).IsRGB32() || VI(args[0]).IsRGB48() || VI(args[0]).IsRGB64(); }
 
+#ifdef NEW_AVSVALUE
+
+AVSValue ArrayCreate(AVSValue args, void*, IScriptEnvironment* env)
+{
+  // empty array comes as an array with one non-defined element (AVSValue.type=='v')
+  if (args[0].IsArray() && args[0].ArraySize()==1 && !args[0][0].Defined())
+    return AVSValue(nullptr, 0); // special case: zero length array
+  else
+    return args[0];
+}
+
+AVSValue IsArray(AVSValue args, void*, IScriptEnvironment* env) { return args[0].IsArray(); }
+
+AVSValue ArrayGet(AVSValue args, void*, IScriptEnvironment* env)
+{
+  const int size = args[0].ArraySize();
+  if (args[1].IsString()) {
+    // associative search
+    // { {"a", element1}, { "b", element2 }, etc..}
+    const char *tag = args[1].AsString();
+    for (int i = 0; i < size; i++)
+    {
+      AVSValue currentTagValue = args[0][i]; // two elements e.g. { "b", element2 }
+      if(!currentTagValue.IsArray())
+        env->ThrowError("Array must contain array[string, any] for lookup");
+      if(currentTagValue.ArraySize() < 2)
+        env->ThrowError("Internal array must have at least two elements (tag, value)");
+      AVSValue currentTag = currentTagValue[0];
+      if (currentTag.IsString() && !lstrcmpi(currentTag.AsString(), tag))
+      {
+        return currentTagValue[1];
+      }
+    }
+    return AVSValue(); // undefined
+  }
+  else if (args[1].IsArray()) {
+    AVSValue indexes = args[1];
+    AVSValue currentValue = args[0];
+    int index_count = indexes.ArraySize(); // array of parameters. a[1,2] -> [1,2]
+    if(index_count == 0)
+      env->ThrowError("ArrayGet: no index specified");
+    for (int i = 0; i < index_count; i++)
+    {
+      if(!indexes[i].IsInt())
+        env->ThrowError("Invalid compound array index: must be integer");
+      if(!currentValue.IsArray())
+        env->ThrowError("ArrayGet: not an array. Problematic index count: %d", i+1);
+      int currentIndex = indexes[i].AsInt();
+      if(currentIndex < 0 || currentIndex >= currentValue.ArraySize())
+        env->ThrowError("Array index out of range. Problematic index count: %d", i+1);
+      currentValue = currentValue[currentIndex];
+    }
+    return currentValue;
+  }
+  env->ThrowError("Invalid array index, must be integer or string, or comma separated integers");
+  return AVSValue(); // undefined
+}
+
+AVSValue ArraySize(AVSValue args, void*, IScriptEnvironment* env)
+{
+  if (!args[0].IsArray())
+    env->ThrowError("Parameter must be array");
+  return args[0].ArraySize();
+}
+#endif

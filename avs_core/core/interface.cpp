@@ -473,16 +473,34 @@ int VideoFrame::GetRowSize(int plane) const {
     }
     else return 0;
   case PLANAR_ALIGNED: case PLANAR_Y_ALIGNED:
-  case PLANAR_R_ALIGNED: case PLANAR_G_ALIGNED: case PLANAR_B_ALIGNED: case PLANAR_A_ALIGNED:
+  case PLANAR_R_ALIGNED: case PLANAR_G_ALIGNED: case PLANAR_B_ALIGNED:
+    {
     const int r = (row_size+FRAME_ALIGN-1)&(~(FRAME_ALIGN-1)); // Aligned rowsize
     if (r<=pitch)
       return r;
     return row_size;
   }
+  case PLANAR_A: 
+    if (pitchA) return row_sizeA; else return 0;
+  case PLANAR_A_ALIGNED: 
+    if(pitchA) {
+      const int r = (row_sizeA+FRAME_ALIGN-1)&(~(FRAME_ALIGN-1)); // Aligned rowsize
+      if (r<=pitchA)
+        return r;
+      return row_sizeA;
+    }
+    else return 0;
+  }
   return row_size; // PLANAR_Y, PLANAR_G, PLANAR_B, PLANAR_R
 }
 
-int VideoFrame::GetHeight(int plane) const {  switch (plane) {case PLANAR_U: case PLANAR_V: if (pitchUV) return heightUV; return 0;} return height; }
+int VideoFrame::GetHeight(int plane) const {  
+  switch (plane) {
+  case PLANAR_U: case PLANAR_V: if (pitchUV) return heightUV; return 0; 
+  case PLANAR_A: if (pitchA) return height; return 0;
+  } 
+  return height;
+}
 
 // Generally you should not be using these two
 VideoFrameBuffer* VideoFrame::GetFrameBuffer() const { return vfb; }
@@ -643,13 +661,61 @@ AVSValue::AVSValue(const AVSValue* a, int size) { type = 'a'; array = a; array_s
    Baked ********************/
 AVSValue::AVSValue(const AVSValue& a, int size)          { CONSTRUCTOR8(&a, size); }
 AVSValue::AVSValue(const AVSValue* a, int size)          { CONSTRUCTOR8(a, size); }
-void AVSValue::CONSTRUCTOR8(const AVSValue* a, int size) { type = 'a'; array_size = (short)size; array = a; }
+void AVSValue::CONSTRUCTOR8(const AVSValue* a, int size) 
+{ 
+  type = 'a'; 
+  array_size = (short)size; 
+#ifndef NEW_AVSVALUE
+  array = a; 
+#else
+  if (a == nullptr || size == 0) {
+    array = nullptr;
+  }
+  else {
+    array = new AVSValue[size];
+    for (int i = 0; i < size; i++) {
+      const_cast<AVSValue *>(array)[i].Assign(&a[i], true); // init from source
+    }
+  }
+#endif
+}
 
 AVSValue::AVSValue(const AVSValue& v)                    { CONSTRUCTOR9(v); }
 void AVSValue::CONSTRUCTOR9(const AVSValue& v)           { Assign(&v, true); }
-                                                        
+
+#ifdef NEW_AVSVALUE
+AVSValue::AVSValue(const AVSValue& v, bool c_arrays) { CONSTRUCTOR10(v, c_arrays); }
+void AVSValue::CONSTRUCTOR10(const AVSValue& v, bool c_arrays)  { Assign2(&v, true, c_arrays); }
+#endif
+
+#ifndef NEW_AVSVALUE
 AVSValue::~AVSValue()                                    { DESTRUCTOR(); }
-void AVSValue::DESTRUCTOR()                              { if (IsClip() && clip) clip->Release(); }
+void AVSValue::DESTRUCTOR()
+{ 
+  if (IsClip() && clip)
+    clip->Release();
+}
+#else
+AVSValue::~AVSValue()                                    { DESTRUCTOR(); }
+void AVSValue::DESTRUCTOR()
+{ 
+  if (IsClip() && clip)
+    clip->Release();
+  if (IsArray() && array_size>0) { 
+    // array_size < 0: marked as C array internally, don't free elements
+    delete[] array; // calls AVSValue destructors for all elements
+    array = nullptr;
+  }
+}
+
+void AVSValue::MarkArrayAsC()
+{
+  // negative value signs to destructor
+  if(array_size > 0)
+    array_size = -array_size;
+}
+
+#endif
 
 AVSValue& AVSValue::operator=(const AVSValue& v)         { return OPERATOR_ASSIGN(v); }
 AVSValue& AVSValue::OPERATOR_ASSIGN(const AVSValue& v)   { Assign(&v, false); return *this; }
@@ -704,7 +770,7 @@ float AVSValue::AsFloatf(float def) const { return float( AsFloat2(def) ); }
 const char* AVSValue::AsString2(const char* def) const { _ASSERTE(IsString()||!Defined()); return IsString() ? string : def; }
 const char* AVSValue::AsString(const char* def) const { return AVSValue::AsString2(def); }
 
-int AVSValue::ArraySize() const { _ASSERTE(IsArray()); return IsArray()?array_size:1; }
+int AVSValue::ArraySize() const { _ASSERTE(IsArray()) ; return IsArray() ? array_size : 1; }
 
 const AVSValue& AVSValue::operator[](int index) const     { return OPERATOR_INDEX(index); }
 const AVSValue& AVSValue::OPERATOR_INDEX(int index) const {
@@ -712,6 +778,7 @@ const AVSValue& AVSValue::OPERATOR_INDEX(int index) const {
   return (IsArray() && index>=0 && index<array_size) ? array[index] : *this;
 }
 
+#ifndef NEW_AVSVALUE
 void AVSValue::Assign(const AVSValue* src, bool init) {
   if (src->IsClip() && src->clip)
     src->clip->AddRef();
@@ -722,6 +789,79 @@ void AVSValue::Assign(const AVSValue* src, bool init) {
   this->array_size = src->array_size;
   this->clip = src->clip; // "clip" is the largest member of the union, making sure we copy everything
 }
+#else
+// this Assign copies array elements for new AVSVALUE handling
+// For C interface, we use Assign2 through CONSTRUCTOR10
+void AVSValue::Assign(const AVSValue* src, bool init) {
+  Assign2(src, init, false);
+}
+
+void AVSValue::Assign2(const AVSValue* src, bool init, bool c_arrays) {
+  if (src->IsClip() && src->clip)
+    src->clip->AddRef();
+  if (c_arrays) {
+    // don't free array members!
+    if (!init && IsClip() && clip)
+      clip->Release();
+
+    this->type = src->type;
+    this->array_size = src->array_size;
+    this->clip = src->clip; // "clip" is the largest member of the union, making sure we copy everything
+    return;
+  }
+  bool shouldRelease = !init && IsClip() && clip;
+  IClip *prev_clip_pointer = (IClip*)((void*)clip); // release at the end
+
+  bool prevIsArray = IsArray();
+  bool nextIsArray = src->IsArray();
+
+  AVSValue* tmp;
+
+  // save existing
+  short tmp_type = src->type;
+  short tmp_array_size = src->array_size;
+  IClip *tmp_pointer = (IClip*)((void*)src->clip); // covers whole union
+
+  bool needtmpcopy = nextIsArray && tmp_array_size>0;
+  // make backup, avoid args = args[0] case
+  if (needtmpcopy)
+  {
+    tmp = new AVSValue[tmp_array_size];
+    for (int i = 0; i < tmp_array_size; i++) {
+      tmp[i].Assign(&src->array[i], true); // init from source
+    }
+  }
+
+  // remove existing
+  if (prevIsArray && !init)
+  {
+    // same as in destructor
+    if (array_size>0) {
+      delete[] array; // calls destructor of AVSValue elements
+      array = nullptr;
+    }
+  }
+
+  if (nextIsArray) {
+    // copy backup source array
+    if (needtmpcopy)
+      array = tmp; // tmp already allocated and filled
+    else
+      array = nullptr;
+    this->type = tmp_type;
+    this->array_size = tmp_array_size;
+  }
+  else {
+    // using tmp_pointer, because if there were array before, that got free'd before
+    // value = value[x] case where source value[x] is not array
+    this->clip = tmp_pointer; // "clip" is the largest member of the union, making sure we copy everything
+    this->type = tmp_type;
+    this->array_size = tmp_array_size; // n/a
+  }
+  if (shouldRelease)
+    prev_clip_pointer->Release();
+}
+#endif
 
 // end class AVSValue
 
@@ -898,7 +1038,9 @@ static const AVS_Linkage avs_linkage = {    // struct AVS_Linkage {
   &VideoInfo::IsRGB64,                      //   bool    (VideoInfo::*IsRGB64)()  const;
   &VideoInfo::IsYUVA,                       //   bool    (VideoInfo::*IsYUVA)()  const;
   &VideoInfo::IsPlanarRGB,                  //   bool    (VideoInfo::*IsPlanarRGB)()  const;
-  &VideoInfo::IsPlanarRGBA,                        //   bool    (VideoInfo::*IsPlanarRGBA)()  const;
+  &VideoInfo::IsPlanarRGBA,                 //   bool    (VideoInfo::*IsPlanarRGBA)()  const;
+// this part should be identical with struct AVS_Linkage in avisynth.h
+
 /**********************************************************************/
 };                                          // }
 

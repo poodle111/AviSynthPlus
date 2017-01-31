@@ -32,47 +32,15 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-#ifndef __Greyscale_H__
-#define __Greyscale_H__
+#ifndef __Convert_AVX2_H__
+#define __Convert_AVX2_H__
 
-#include <avisynth.h>
+#include "../core/internal.h"
 
+template<typename pixel_t, uint8_t targetbits>
+void convert_32_to_uintN_c_avx2(const BYTE *srcp, BYTE *dstp, int src_rowsize, int src_height, int src_pitch, int dst_pitch, float float_range);
 
-struct GreyConversionMatrix {
-  int r;    // for 15bit scaled integer arithmetic
-  int g;
-  int b;
-  float r_f;    // for float operation
-  float g_f;
-  float b_f;
-};
+template<bool expandrange, uint8_t shiftbits>
+void convert_uint16_to_uint16_c_avx2(const BYTE *srcp, BYTE *dstp, int src_rowsize, int src_height, int src_pitch, int dst_pitch, float float_range);
 
-class Greyscale : public GenericVideoFilter 
-/**
-  * Class to convert video to greyscale
- **/
-{
-public:
-  Greyscale(PClip _child, const char* matrix, IScriptEnvironment* env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env);
-
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
-
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override {
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
-
-private:
-  void BuildGreyMatrix();
-  GreyConversionMatrix greyMatrix;
-  int matrix_;
-  enum {Rec601 = 0, Rec709, Average, Rec2020 };
-  int pixelsize;
-  int bits_per_pixel;
-
-};
-
-
-
-
-#endif  // __Greyscale_H__
+#endif  // __Convert_AVX2_H__

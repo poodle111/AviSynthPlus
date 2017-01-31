@@ -117,10 +117,11 @@ PVideoFrame __stdcall Cache::GetFrame(int n, IScriptEnvironment* env)
   std::chrono::time_point<std::chrono::high_resolution_clock> t_start, t_end; 
   t_start = std::chrono::high_resolution_clock::now(); // t_start starts in the constructor. Used in logging
 
-  LruLookupResult LruLookupRes = _pimpl->VideoCache->lookup(n, &cache_handle, true);
+  LruLookupResult LruLookupRes = _pimpl->VideoCache->lookup(n, &cache_handle, true, result);
   switch (LruLookupRes)
 #else
-  switch(_pimpl->VideoCache->lookup(n, &cache_handle, true))
+  // fill result in lookup before releasing cache handle lock
+  switch(_pimpl->VideoCache->lookup(n, &cache_handle, true, result))
 #endif
   {
   case LRU_LOOKUP_NOT_FOUND:
@@ -178,13 +179,17 @@ PVideoFrame __stdcall Cache::GetFrame(int n, IScriptEnvironment* env)
     }
   case LRU_LOOKUP_FOUND_AND_READY:
     {
-      result = cache_handle.first->value;
+      // theoretically cache_handle here may point to wrong entry, 
+      // because the lock in lookup is released before this readout
+      // solution:
+      // when LRU_LOOKUP_FOUND_AND_READY, the cache_handle.first->value is copied and returned in result itself
+      // result =  cache_handle.first->value; // old method not needed, result is filled already by lookup
 #ifdef _DEBUG	
       t_end = std::chrono::high_resolution_clock::now();
       std::chrono::duration<double> elapsed_seconds = t_end - t_start;
       std::string name = FuncName;
       char buf[256];
-      _snprintf(buf, 255, "Cache::GetFrame LRU_LOOKUP_FOUND_AND_READY: [%s] n=%6d child=%p frame=%p vfb=%p videoCacheSize=%zu SeekTime            :%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)cache_handle.first->value, (void *)cache_handle.first->value->GetFrameBuffer(), _pimpl->VideoCache->size(), elapsed_seconds.count()); // P.F.
+      _snprintf(buf, 255, "Cache::GetFrame LRU_LOOKUP_FOUND_AND_READY: [%s] n=%6d child=%p frame=%p vfb=%p videoCacheSize=%zu SeekTime            :%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)result, (void *)result->GetFrameBuffer(), _pimpl->VideoCache->size(), elapsed_seconds.count());
       _RPT0(0, buf);
       assert(result != NULL);
 #endif

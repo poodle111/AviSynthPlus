@@ -81,7 +81,10 @@ static std::string GetFullPathNameWrap(const std::string &f)
 
 static bool IsParameterTypeSpecifier(char c) {
   switch (c) {
-    case 'b': case 'i': case 'f': case 's': case 'c': case '.':
+  case 'b': case 'i': case 'f': case 's': case 'c': case '.': 
+#ifdef NEW_AVSVALUE
+  case 'a': // Arrays as function parameters
+#endif
       return true;
     default:
       return false;
@@ -90,7 +93,7 @@ static bool IsParameterTypeSpecifier(char c) {
 
 static bool IsParameterTypeModifier(char c) {
   switch (c) {
-    case '+': case '*':
+    case '+': case '*': 
       return true;
     default:
       return false;
@@ -225,12 +228,50 @@ bool AVSFunction::empty() const
 
 bool AVSFunction::IsScriptFunction() const
 {
-    return ( (apply == &(ScriptFunction::Execute))
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  /*
+  if (!strcmp(this->name, "YPlaneMax"))
+    return true;
+  if (!strcmp(this->name, "YPlaneMin"))
+    return true;
+  if (!strcmp(this->name, "LumaDifference"))
+    return true;
+    */
+/*
+  if (!stricmp(this->name, "yplanemax"))
+    return true;
+  if (!stricmp(this->name, "yplanemin"))
+    return true;
+  if (!stricmp(this->name, "lumadifference"))
+    return true;
+  */  
+  //if (!stricmp(this->name, "srestore_inside_1"))
+  //  return true;
+#endif  
+  return ( (apply == &(ScriptFunction::Execute))
 		  || (apply == &Eval)
           || (apply == &EvalOop)
           || (apply == &Import)
         );
 }
+
+#ifdef DEBUG_GSCRIPTCLIP_MT
+bool AVSFunction::IsRuntimeScriptFunction() const
+{
+  
+  if (!strcmp(this->name, "YPlaneMax"))
+  return true;
+  if (!strcmp(this->name, "YPlaneMin"))
+  return true;
+  if (!strcmp(this->name, "LumaDifference"))
+  return true;
+  
+  //if (!stricmp(this->name, "srestore_inside_1"))
+  //  return true;
+
+  return (apply == &(ScriptFunction::Execute));
+}
+#endif
 
 bool AVSFunction::SingleTypeMatch(char type, const AVSValue& arg, bool strict) {
   switch (type) {
@@ -240,6 +281,9 @@ bool AVSFunction::SingleTypeMatch(char type, const AVSValue& arg, bool strict) {
     case 'f': return arg.IsFloat() && (!strict || !arg.IsInt());
     case 's': return arg.IsString();
     case 'c': return arg.IsClip();
+#ifdef NEW_AVSVALUE
+    case 'a': return arg.IsArray(); // PF 161028 AVS+ script arrays 
+#endif
     default:  return false;
   }
 }
@@ -248,6 +292,19 @@ bool AVSFunction::TypeMatch(const char* param_types, const AVSValue* args, size_
 
   bool optional = false;
 
+  /*
+  { "StackHorizontal", BUILTIN_FUNC_PREFIX, "cc+", StackHorizontal::Create },
+  { "Spline", BUILTIN_FUNC_PREFIX, "[x]ff+[cubic]b", Spline },
+  { "Select",   BUILTIN_FUNC_PREFIX, "i.+", Select },
+  { "Array", BUILTIN_FUNC_PREFIX, ".#", ArrayCreate },  // # instead of +: creates script array
+
+  { "IsArray",   BUILTIN_FUNC_PREFIX, ".", IsArray },
+  { "ArrayGet",  BUILTIN_FUNC_PREFIX, "ai", ArrayGet },
+  { "ArrayGet",  BUILTIN_FUNC_PREFIX, "as", ArrayGet },
+  { "ArraySize", BUILTIN_FUNC_PREFIX, "a", ArraySize },
+  */
+  // arguments are provided in a flattened way (flattened=array elements extracted)
+  // e.g.    string array is provided here string,string,string
   size_t i = 0;
   while (i < num_args) {
 
@@ -277,7 +334,10 @@ bool AVSFunction::TypeMatch(const char* param_types, const AVSValue* args, size_
     }
 
     switch (*param_types) {
-      case 'b': case 'i': case 'f': case 's': case 'c':
+      case 'b': case 'i': case 'f': case 's': case 'c': 
+#ifdef NEW_AVSVALUE
+      case 'a': // PF Arrays
+#endif
         if (   (!optional || args[i].Defined())
             && !SingleTypeMatch(*param_types, args[i], strict))
           return false;
@@ -286,7 +346,22 @@ bool AVSFunction::TypeMatch(const char* param_types, const AVSValue* args, size_
         ++param_types;
         ++i;
         break;
-      case '+': case '*':
+      case '+': case '*': 
+#ifdef NEW_AVSVALUE
+        if (param_types[-1] != '.' && args[i].IsArray()) { // PF new Arrays
+          // all elements in the array should match with the type char preceding '+*'
+          // only one array level is enough
+          for (int j = 0; j < args[i].ArraySize(); j++)
+          {
+            if (!SingleTypeMatch(param_types[-1], args[i][j], strict))
+              return false;
+          }
+          // we're done with the + or *
+          ++param_types;
+          ++i;
+        }
+        else 
+#endif
         if (!SingleTypeMatch(param_types[-1], args[i], strict)) {
           // we're done with the + or *
           ++param_types;

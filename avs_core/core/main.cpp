@@ -113,10 +113,10 @@ static long gRefCnt=0;
 
 
 extern "C" const GUID CLSID_CAVIFileSynth   // {E6D6B700-124D-11D4-86F3-DB80AFD98778}
-  = {0xe6d6b700, 0x124d, 0x11d4, {0x86, 0xf3, 0xdb, 0x80, 0xaf, 0xd9, 0x87, 0x78}};
+= {0xe6d6b700, 0x124d, 0x11d4, {0x86, 0xf3, 0xdb, 0x80, 0xaf, 0xd9, 0x87, 0x78}};
 
 extern "C" const GUID IID_IAvisynthClipInfo   // {E6D6B708-124D-11D4-86F3-DB80AFD98778}
-  = {0xe6d6b708, 0x124d, 0x11d4, {0x86, 0xf3, 0xdb, 0x80, 0xaf, 0xd9, 0x87, 0x78}};
+= {0xe6d6b708, 0x124d, 0x11d4, {0x86, 0xf3, 0xdb, 0x80, 0xaf, 0xd9, 0x87, 0x78}};
 
 
 struct IAvisynthClipInfo : IUnknown {
@@ -141,8 +141,14 @@ private:
 
   bool VDubPlanarHack;
   bool AVIPadScanlines;
+  bool Enable_V210;
+  bool Enable_b64a;
+  bool Enable_Y3_10_10;
+  bool Enable_Y3_10_16;
+  bool Enable_PlanarToPackedRGB;
 
-  int ImageSize();
+
+  int ImageSize(const VideoInfo *vi);
 
   bool DelayInit();
   bool DelayInit2();
@@ -195,7 +201,7 @@ public:
   STDMETHODIMP WriteData(DWORD fcc, LPVOID lpBuffer, LONG cbBuffer);          // 6
   STDMETHODIMP DeleteStream(DWORD fccType, LONG lParam);                      // 9
 
-  //////////// IAvisynthClipInfo
+                                                                              //////////// IAvisynthClipInfo
 
   int __stdcall GetError(const char** ppszMessage);
   bool __stdcall GetParity(int n);
@@ -522,9 +528,9 @@ STDMETHODIMP CAVIFileSynth::EndRecord() {
 }
 
 STDMETHODIMP CAVIFileSynth::Save(LPCSTR szFile, AVICOMPRESSOPTIONS FAR *lpOptions,
-                                 AVISAVECALLBACK lpfnCallback) {
-                                   _RPT1(0,"%p->CAVIFileSynth::Save()\n", this);
-                                   return AVIERR_READONLY;
+  AVISAVECALLBACK lpfnCallback) {
+  _RPT1(0,"%p->CAVIFileSynth::Save()\n", this);
+  return AVIERR_READONLY;
 }
 
 STDMETHODIMP CAVIFileSynth::ReadData(DWORD fcc, LPVOID lp, LONG *lpcb) {
@@ -558,6 +564,11 @@ CAVIFileSynth::CAVIFileSynth(const CLSID& rclsid) {
 
   VDubPlanarHack = false;
   AVIPadScanlines = false;
+  Enable_V210 = false;
+  Enable_b64a = false;
+  Enable_Y3_10_10 = false;
+  Enable_Y3_10_16 = false;
+  Enable_PlanarToPackedRGB = false;
 
   InitializeCriticalSection(&cs_filter_graph);
 }
@@ -678,6 +689,16 @@ bool CAVIFileSynth::DelayInit2() {
         // Option to have scanlines mod4 padded in all pixel formats
         AVIPadScanlines = env->GetVar(VARNAME_AVIPadScanlines, false);
 
+        // AVS+ Enable_V210 instead of P210
+        Enable_V210 = env->GetVar(VARNAME_Enable_V210, false);
+        // AVS+ y3[10][10] instead of P210
+        Enable_Y3_10_10 = env->GetVar(VARNAME_Enable_Y3_10_10, false);
+        // AVS+ y3[10][16] instead of P216
+        Enable_Y3_10_16 = env->GetVar(VARNAME_Enable_Y3_10_16, false);
+        // AVS+ Enable_V210 instead of BRA[64]
+        Enable_b64a = env->GetVar(VARNAME_Enable_b64a, false);
+        // AVS+ Enable on-the-fly Planar RGB to Packed RGB conversion
+        Enable_PlanarToPackedRGB = env->GetVar(VARNAME_Enable_PlanarToPackedRGB, false);
       }
       catch (const AvisynthError &error) {
         error_msg = error.msg;
@@ -972,31 +993,100 @@ STDMETHODIMP_(LONG) CAVIStreamSynth::Info(AVISTREAMINFOW *psi, LONG lSize) {
     asi.dwSampleSize = bytes_per_sample;
     wcscpy(asi.szName, L"Avisynth audio #1");
   } else {
-    const int image_size = parent->ImageSize();
-    asi.fccHandler = 'UNKN';
-    if (vi->IsRGB())
-      asi.fccHandler = ' BID';
-    else if (vi->IsYUY2())
-      asi.fccHandler = '2YUY';
-    else if (vi->IsYV12())
-      asi.fccHandler = '21VY';
-    else if (vi->IsY8())
-      asi.fccHandler = '008Y';
-    else if (vi->IsYV24())
-      asi.fccHandler = '42VY';
-    else if (vi->IsYV16())
-      asi.fccHandler = '61VY';
-    else if (vi->IsYV411())
-      asi.fccHandler = 'B14Y';
+    bool targetIsConvertedToPackedRGB = (parent->Enable_PlanarToPackedRGB && (vi->IsPlanarRGB() || vi->IsPlanarRGBA()));
+
+    VideoInfo vi_final = *vi;
+    // if basic type is changed, that affects buffer size, we change the format here
+    if (targetIsConvertedToPackedRGB) {
+      // Enable_PlanarToPackedRGB results in packed RGB64 for bits>8, RGB24/32 for 8 bits
+      if (vi->BitsPerComponent() == 8) {
+        if (vi->IsPlanarRGB())
+          vi_final.pixel_type = VideoInfo::CS_BGR24;
+        else // planar RGBA
+          vi_final.pixel_type = VideoInfo::CS_BGR32;
+      }
+      else // all 8+ bit planar RGB(A) is converted to RGB64
+        vi_final.pixel_type = VideoInfo::CS_BGR64;
+    }
+    // silent mapping of 12/14 bit YUV formats to 16 bit
+    if (vi->pixel_type == VideoInfo::CS_YUV420P12 || vi->pixel_type == VideoInfo::CS_YUV420P14 || vi->pixel_type == VideoInfo::CS_YUV420PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV420P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUV422P12 || vi->pixel_type == VideoInfo::CS_YUV422P14 || vi->pixel_type == VideoInfo::CS_YUV422PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV422P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUV444P10 || vi->pixel_type == VideoInfo::CS_YUV444P12 || vi->pixel_type == VideoInfo::CS_YUV444P14 || vi->pixel_type == VideoInfo::CS_YUV444PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV444P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
+      vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+    // -- pixel_type change end
+
+    const int image_size = parent->ImageSize(&vi_final);
+    asi.fccHandler = MAKEFOURCC('N','K','N','U'); // 'UNKN';
+
+    if (vi_final.IsRGB() && !vi_final.IsPlanar() && vi_final.BitsPerComponent() == 8)
+      asi.fccHandler = MAKEFOURCC('D','I','B',' ');
+    else if (vi_final.IsYUY2())
+      asi.fccHandler = MAKEFOURCC('Y','U','Y','2');
+    else if (vi_final.IsYV12())
+      asi.fccHandler = MAKEFOURCC('Y','V','1','2');
+    else if (vi_final.IsY8())
+      asi.fccHandler = MAKEFOURCC('Y','8','0','0');
+    else if (vi_final.IsYV24())
+      asi.fccHandler = MAKEFOURCC('Y','V','2','4');
+    else if (vi_final.IsYV16())
+      asi.fccHandler = MAKEFOURCC('Y','V','1','6');
+    else if (vi_final.IsYV411())
+      asi.fccHandler = MAKEFOURCC('Y','4','1','B');
+    // avs+
+    else if (vi_final.IsRGB64() && parent->Enable_b64a)
+      asi.fccHandler = MAKEFOURCC('b','6','4','a'); // b64a = packed rgba 4*16-bit
+    else if (vi_final.IsRGB64())
+      asi.fccHandler = MAKEFOURCC('B','R','A',64); // BRA@ ie. BRA[64]
+    else if (vi_final.IsRGB48())
+      asi.fccHandler = MAKEFOURCC('B','G','R',48); // BGR0 ie. BGR[48]
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV420P10)
+      asi.fccHandler = MAKEFOURCC('P','0','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV420P16)
+      asi.fccHandler = MAKEFOURCC('P','0','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_V210)
+      asi.fccHandler = MAKEFOURCC('v','2','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_Y3_10_10)
+      asi.fccHandler = MAKEFOURCC('Y', '3', 10, 10); // Y3[10][10] (AV_PIX_FMT_YUV422P10) = planar YUV 422*10-bit
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10) 
+      asi.fccHandler = MAKEFOURCC('P','2','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P16 && parent->Enable_Y3_10_16) 
+      asi.fccHandler = MAKEFOURCC('Y', '3', 10, 16); // Y3[10][16] (AV_PIX_FMT_YUV422P16) = planar YUV 422*16-bit
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P16) 
+      asi.fccHandler = MAKEFOURCC('P','2','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV444P16 || vi_final.pixel_type == VideoInfo::CS_YUVA444P16) 
+      asi.fccHandler = MAKEFOURCC('Y','4','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP) // 8 bit planar RGB?? 
+      asi.fccHandler = MAKEFOURCC('8','B','P','S');
+    // MagicYUV implements these (planar rgb/rgba 10,12,14,16) G3[0][10], G4[0][10], G3[0][12], G4[0][12], G3[0][14], G4[0][14], G3[0][16], G4[0][16]
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP10)
+      asi.fccHandler = MAKEFOURCC('G','3',0,10);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP12)
+      asi.fccHandler = MAKEFOURCC('G','3',0,12);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP14)
+      asi.fccHandler = MAKEFOURCC('G','3',0,14);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP16)
+      asi.fccHandler = MAKEFOURCC('G','3',0,16);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP10)
+      asi.fccHandler = MAKEFOURCC('G','4',0,10);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP12)
+      asi.fccHandler = MAKEFOURCC('G','4',0,12);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP14)
+      asi.fccHandler = MAKEFOURCC('G','4',0,14);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP16)
+      asi.fccHandler = MAKEFOURCC('G','4',0,16);
     else {
       _ASSERT(FALSE);
     }
 
-    asi.dwScale = vi->fps_denominator;
-    asi.dwRate = vi->fps_numerator;
-    asi.dwLength = vi->num_frames;
-    asi.rcFrame.right = vi->width;
-    asi.rcFrame.bottom = vi->height;
+    asi.dwScale = vi_final.fps_denominator;
+    asi.dwRate = vi_final.fps_numerator;
+    asi.dwLength = vi_final.num_frames;
+    asi.rcFrame.right = vi_final.width;
+    asi.rcFrame.bottom = vi_final.height;
     asi.dwSampleSize = image_size;
     asi.dwSuggestedBufferSize = image_size;
     wcscpy(asi.szName, L"Avisynth video #1");
@@ -1024,31 +1114,125 @@ STDMETHODIMP_(LONG) CAVIStreamSynth::FindSample(LONG lPos, LONG lFlags) {
 ////////////////////////////////////////////////////////////////////////
 //////////// local
 
-int CAVIFileSynth::ImageSize() {
+int CAVIFileSynth::ImageSize(const VideoInfo *vi) {
   int image_size;
-
-  if (vi->IsRGB() || vi->IsYUY2() || vi->IsY8() || vi->IsColorSpace(VideoInfo::CS_Y16) || vi->IsColorSpace(VideoInfo::CS_Y32) || AVIPadScanlines) {
+  if (vi->pixel_type == VideoInfo::CS_YUV444P16 || vi->pixel_type == VideoInfo::CS_YUVA444P16)
+  { // Y416 packed 4444 U,Y,V,A
+    image_size = vi->width * vi->height * 4 * sizeof(uint16_t);
+  }
+  else if (vi->pixel_type == VideoInfo::CS_YUV422P10 && Enable_V210)
+  {
+    image_size = ((16 * ((vi->width + 5) / 6) + 127) & ~127);
+    image_size *= vi->height;
+  }
+  else if ((vi->IsRGB() && !vi->IsPlanar()) || vi->IsYUY2() || vi->IsY() || AVIPadScanlines) {
+    // incl. all packed RGBs
     image_size = vi->BMPSize();
   }
   else { // Packed size
-    image_size = vi->RowSize(PLANAR_U);
-    if (image_size) {
-      image_size  *= vi->height;
-      image_size >>= vi->GetPlaneHeightSubsampling(PLANAR_U);
-      image_size  *= 2;
+    if (vi->IsPlanar() && vi->IsRGB()) {
+      image_size = (vi->RowSize(PLANAR_G) * vi->height);
+      if (vi->IsPlanarRGBA()) // not supported yet, but for the sake of completeness
+        image_size *= 4;
+      else
+        image_size *= 3;
     }
-    image_size += vi->RowSize(PLANAR_Y) * vi->height;
+    else {
+      image_size = vi->RowSize(PLANAR_U);
+      if (image_size) {
+        image_size *= vi->height;
+        image_size >>= vi->GetPlaneHeightSubsampling(PLANAR_U);
+        image_size *= 2;
+      }
+      image_size += vi->RowSize(PLANAR_Y) * vi->height;
+    }
   }
   return image_size;
 }
 
 
 void CAVIStreamSynth::ReadFrame(void* lpBuffer, int n) {
-  PVideoFrame frame = parent->filter_graph->GetFrame(n, parent->env);
+  VideoInfo vi = parent->filter_graph->GetVideoInfo();
+  PVideoFrame frame;
+
+  if (((vi.Is420() || vi.Is422()) && (vi.BitsPerComponent() == 12 || vi.BitsPerComponent() == 14 || vi.BitsPerComponent() == 32)) ||
+    (vi.Is444() && (vi.BitsPerComponent() > 8 && vi.BitsPerComponent() != 16)))
+  {
+    // silent mapping of 12/14bit/float YUV420/422 formats to 16 bits
+    AVSValue new_args[2] = { parent->filter_graph, 16 };
+    PClip newClip = parent->env->Invoke("ConvertBits", AVSValue(new_args, 2)).AsClip();
+    frame = newClip->GetFrame(n, parent->env);
+    vi = newClip->GetVideoInfo();
+  }
+  else if (parent->Enable_PlanarToPackedRGB && (vi.IsPlanarRGB() || vi.IsPlanarRGBA())) {
+    PClip newClip;
+    // convert Planar RGB to RGB24/32/RGB64
+    if (vi.BitsPerComponent() == 8) // 8 bit: ConvertToRGB24/32
+    {
+      if (vi.IsPlanarRGB()) {
+        AVSValue new_args[1] = { parent->filter_graph };
+        newClip = parent->env->Invoke("ConvertToRGB24", AVSValue(new_args, 1)).AsClip();
+      }
+      else { // IsPlanarRGBA()
+        AVSValue new_args[1] = { parent->filter_graph };
+        newClip = parent->env->Invoke("ConvertToRGB32", AVSValue(new_args, 1)).AsClip();
+      }
+    }
+    else {
+      // 8+ bits, always RGB64
+      newClip = parent->filter_graph;
+      if (vi.BitsPerComponent() != 16) {
+        AVSValue new_args[2] = { newClip, 16 };
+        newClip = parent->env->Invoke("ConvertBits", AVSValue(new_args, 2)).AsClip();
+      }
+      AVSValue new_args[1] = { newClip };
+      newClip = parent->env->Invoke("ConvertToRGB64", AVSValue(new_args, 1)).AsClip();
+    }
+    frame = newClip->GetFrame(n, parent->env);
+    vi = newClip->GetVideoInfo();
+  }
+  else {
+    // no on-the-fly conversion
+    frame = parent->filter_graph->GetFrame(n, parent->env);
+  }
   if (!frame)
     parent->env->ThrowError("Avisynth error: generated video frame was nil (this is a bug)");
 
-  VideoInfo vi = parent->filter_graph->GetVideoInfo();
+  // Y416 packed U,Y,V,A
+  if (vi.pixel_type == VideoInfo::CS_YUV444P16 || vi.pixel_type == VideoInfo::CS_YUVA444P16) {
+    int width = vi.width;
+    int height = vi.height;
+    int ppitch_y = frame->GetPitch(PLANAR_Y) / sizeof(uint16_t);
+    int ppitch_uv = frame->GetPitch(PLANAR_U) / sizeof(uint16_t);
+    int ppitch_a = frame->GetPitch(PLANAR_A) / sizeof(uint16_t);
+    bool hasAlpha = (vi.NumComponents() == 4);
+    const uint16_t *yptr = (const uint16_t *)frame->GetReadPtr(PLANAR_Y);
+    const uint16_t *uptr = (const uint16_t *)frame->GetReadPtr(PLANAR_U);
+    const uint16_t *vptr = (const uint16_t *)frame->GetReadPtr(PLANAR_V);
+    const uint16_t *aptr = (const uint16_t *)frame->GetReadPtr(PLANAR_A);
+    uint16_t *outbuf = (uint16_t *)lpBuffer;
+    int out_pitch = width * 4;
+    for (int y = 0; y < height; y++) {
+      const uint16_t *yline = yptr;
+      const uint16_t *uline = uptr;
+      const uint16_t *vline = vptr;
+      const uint16_t *aline = aptr;
+      uint16_t *out_line = outbuf;
+      for (int x = 0; x < width; x++) {
+        out_line[x*4+0] = uline[x];
+        out_line[x*4+1] = yline[x];
+        out_line[x*4+2] = vline[x];
+        out_line[x*4+3] = hasAlpha ? aline[x] : 0xFFFF;
+      }
+      outbuf += out_pitch;
+      yptr += ppitch_y;
+      uptr += ppitch_uv;
+      vptr += ppitch_uv;
+      aptr += ppitch_a;
+    }
+    return;
+  }
+
   const int pitch    = frame->GetPitch();
   const int row_size = frame->GetRowSize();
   const int height   = frame->GetHeight();
@@ -1057,37 +1241,151 @@ void CAVIStreamSynth::ReadFrame(void* lpBuffer, int n) {
   int out_pitchUV;
 
   // BMP scanlines are dword-aligned
-  if (vi.IsRGB() || vi.IsYUY2() || vi.IsY8() || vi.IsColorSpace(VideoInfo::CS_Y16) || vi.IsColorSpace(VideoInfo::CS_Y32) || parent->AVIPadScanlines) {
+  if ((vi.IsRGB() && !vi.IsPlanar()) || vi.IsYUY2() || vi.IsY() || parent->AVIPadScanlines) {
     out_pitch = (row_size+3) & ~3;
-    out_pitchUV = (frame->GetRowSize(PLANAR_U)+3) & ~3;
+    out_pitchUV = (frame->GetRowSize(PLANAR_U)+3) & ~3; // 0 for packed RGB
   }
   // Planar scanlines are packed
   else {
     out_pitch = row_size;
-    out_pitchUV = frame->GetRowSize(PLANAR_U);
+    if(vi.IsRGB())
+      out_pitchUV = frame->GetRowSize(PLANAR_B); // G=B=R
+    else
+      out_pitchUV = frame->GetRowSize(PLANAR_U);
   }
 
-  // Set default VFW output plane order.
-  int plane1 = PLANAR_V;
-  int plane2 = PLANAR_U;
+  int plane1;
+  int plane2;
 
   // Old VDub wants YUV for YV24 and YV16 and YVU for YV12.
-  if (parent->VDubPlanarHack && !vi.IsYV12()) {
+  if (parent->VDubPlanarHack && !vi.IsYV12() && !vi.IsRGB() && vi.BitsPerComponent() == 8) {
     plane1 = PLANAR_U;
     plane2 = PLANAR_V;
   }
+  else {
+    if (vi.IsRGB() && vi.IsPlanar())
+    {
+      // (PLANAR_G)
+      plane1 = PLANAR_B;
+      plane2 = PLANAR_R;
+    }
+    else {
+      if (vi.BitsPerComponent() == 8) {
+      // Set default VFW output plane order.
+        plane1 = PLANAR_V;
+        plane2 = PLANAR_U;
+      }
+      else {
+        plane1 = PLANAR_U;
+        plane2 = PLANAR_V;
+      }
+    }
+  }
 
-  parent->env->BitBlt((BYTE*)lpBuffer, out_pitch, frame->GetReadPtr(), pitch, row_size, height);
+  // thx vs
+  bool semi_packed_p10 = (vi.pixel_type == VideoInfo::CS_YUV420P10) || (vi.pixel_type == VideoInfo::CS_YUV422P10) ;
+  bool semi_packed_p16 = (vi.pixel_type == VideoInfo::CS_YUV420P16) || (vi.pixel_type == VideoInfo::CS_YUV422P16) ;
 
-  parent->env->BitBlt((BYTE*)lpBuffer + (out_pitch*height),
-    out_pitchUV,             frame->GetReadPtr(plane1),
-    frame->GetPitch(plane1), frame->GetRowSize(plane1),
-    frame->GetHeight(plane1) );
+  if (vi.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_V210) {
+    int width = frame->GetRowSize(PLANAR_Y) / vi.ComponentSize();
+    int ppitch_y = frame->GetPitch(PLANAR_Y) / 2;
+    int ppitch_uv = frame->GetPitch(PLANAR_U) / 2;
+    const uint16_t *yptr = (const uint16_t *)frame->GetReadPtr(PLANAR_Y);
+    const uint16_t *uptr = (const uint16_t *)frame->GetReadPtr(PLANAR_U);
+    const uint16_t *vptr = (const uint16_t *)frame->GetReadPtr(PLANAR_V);
+    uint32_t *outbuf = (uint32_t *)lpBuffer;
+    out_pitch = ((16*((width + 5) / 6) + 127) & ~127)/4;
+    for (int y = 0; y < height; y++) {
+      const uint16_t *yline = yptr;
+      const uint16_t *uline = uptr;
+      const uint16_t *vline = vptr;
+      uint32_t *out_line = outbuf;
+      for (int x = 0; x < width + 5; x += 6) {
+        out_line[0] = (uline[0] | (yline[0] << 10) | (vline[0] << 20));
+        out_line[1] = (yline[1] | (uline[1] << 10) | (yline[2] << 20));
+        out_line[2] = (vline[1] | (yline[3] << 10) | (uline[2] << 20));
+        out_line[3] = (yline[4] | (vline[2] << 10) | (yline[5] << 20));
+        out_line += 4;
+        yline += 6;
+        uline += 3;
+        vline += 3;
+      }
+      outbuf += out_pitch;
+      yptr += ppitch_y;
+      uptr += ppitch_uv;
+      vptr += ppitch_uv;
+    }
+  } else if (semi_packed_p10 && !parent->Enable_Y3_10_10 && !parent->Enable_V210) {
+    int pwidth = frame->GetRowSize(PLANAR_Y) / vi.ComponentSize();
+    int ppitch = frame->GetPitch(PLANAR_Y) / 2;
+    uint16_t *outbuf = (uint16_t *)lpBuffer;
+    const uint16_t *yptr = (const uint16_t *)frame->GetReadPtr(PLANAR_Y);
 
-  parent->env->BitBlt((BYTE*)lpBuffer + (out_pitch*height + frame->GetHeight(plane1)*out_pitchUV),
-    out_pitchUV,             frame->GetReadPtr(plane2),
-    frame->GetPitch(plane2), frame->GetRowSize(plane2),
-    frame->GetHeight(plane2) );
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < pwidth; x++) {
+        outbuf[x] = yptr[x] << 6;
+      }
+      outbuf += out_pitch/2;
+      yptr += ppitch;
+    }
+  }
+  else {
+    if (vi.IsRGB48() || vi.IsRGB64())
+    {
+      // avisynth: upside down, output: back to normal
+      parent->env->BitBlt((BYTE*)lpBuffer+out_pitch*(height-1), -out_pitch, frame->GetReadPtr(), pitch, row_size, height);
+    }
+    else {
+      parent->env->BitBlt((BYTE*)lpBuffer, out_pitch, frame->GetReadPtr(), pitch, row_size, height);
+    }
+  }
+
+  if (vi.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_V210) {
+    // intentionally empty
+  } else if ((semi_packed_p10 && !parent->Enable_Y3_10_10 && !parent->Enable_V210) || 
+    (semi_packed_p16 && !parent->Enable_Y3_10_16)) {
+    int pheight = frame->GetHeight(PLANAR_U);
+    int pwidth = frame->GetRowSize(PLANAR_U) / vi.ComponentSize();
+    int ppitch = frame->GetPitch(PLANAR_U) / 2;
+    BYTE *outadj = (BYTE*)lpBuffer + out_pitch*height;
+    uint16_t *outbuf = (uint16_t *)outadj;
+    const uint16_t *uptr = (const uint16_t *)frame->GetReadPtr(PLANAR_U);
+    const uint16_t *vptr = (const uint16_t *)frame->GetReadPtr(PLANAR_V);
+
+    if (semi_packed_p16) {
+      for (int y = 0; y < pheight; y++) {
+        for (int x = 0; x < pwidth; x++) {
+          outbuf[2*x] = uptr[x];
+          outbuf[2*x + 1] = vptr[x];
+        }
+        outbuf += out_pitchUV;
+        uptr += ppitch;
+        vptr += ppitch;
+      }
+    } else {
+      for (int y = 0; y < pheight; y++) {
+        for (int x = 0; x < pwidth; x++) {
+          outbuf[2*x] = uptr[x] << 6;
+          outbuf[2*x + 1] = vptr[x] << 6;
+        }
+        outbuf += out_pitchUV;
+        uptr += ppitch;
+        vptr += ppitch;
+      }
+    }
+  }
+  else {
+    parent->env->BitBlt((BYTE*)lpBuffer + (out_pitch*height),
+      out_pitchUV, frame->GetReadPtr(plane1),
+      frame->GetPitch(plane1), frame->GetRowSize(plane1),
+      frame->GetHeight(plane1));
+
+    parent->env->BitBlt((BYTE*)lpBuffer + (out_pitch*height + frame->GetHeight(plane1)*out_pitchUV),
+      out_pitchUV, frame->GetReadPtr(plane2),
+      frame->GetPitch(plane2), frame->GetRowSize(plane2),
+      frame->GetHeight(plane2));
+  }
+  // no alpha?
 }
 
 
@@ -1125,6 +1423,32 @@ HRESULT CAVIStreamSynth::Read2(LONG lStart, LONG lSamples, LPVOID lpBuffer, LONG
 
   const VideoInfo* const vi = parent->vi;
 
+  bool targetIsConvertedToPackedRGB = (parent->Enable_PlanarToPackedRGB && (vi->IsPlanarRGB() || vi->IsPlanarRGBA()));
+
+  VideoInfo vi_final = *vi;
+  // if basic type is changed, that affects buffer size, we change the format here
+  if (targetIsConvertedToPackedRGB) {
+    // Enable_PlanarToPackedRGB results in packed RGB64 for bits>8, RGB24/32 for 8 bits
+    if (vi->BitsPerComponent() == 8) {
+      if (vi->IsPlanarRGB())
+        vi_final.pixel_type = VideoInfo::CS_BGR24;
+      else // planar RGBA
+        vi_final.pixel_type = VideoInfo::CS_BGR32;
+    }
+    else // all 8+ bit planar RGB(A) is converted to RGB64
+      vi_final.pixel_type = VideoInfo::CS_BGR64;
+  }
+  // silent mapping of 12/14/float bit YUV formats to 16 bit
+  if (vi->pixel_type == VideoInfo::CS_YUV420P12 || vi->pixel_type == VideoInfo::CS_YUV420P14 || vi->pixel_type == VideoInfo::CS_YUV420PS)
+    vi_final.pixel_type = VideoInfo::CS_YUV420P16;
+  else if (vi->pixel_type == VideoInfo::CS_YUV422P12 || vi->pixel_type == VideoInfo::CS_YUV422P14 || vi->pixel_type == VideoInfo::CS_YUV422PS)
+    vi_final.pixel_type = VideoInfo::CS_YUV422P16;
+  else if (vi->pixel_type == VideoInfo::CS_YUV444P10 || vi->pixel_type == VideoInfo::CS_YUV444P12 || vi->pixel_type == VideoInfo::CS_YUV444P14 || vi->pixel_type == VideoInfo::CS_YUV444PS)
+    vi_final.pixel_type = VideoInfo::CS_YUV444P16;
+  else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
+    vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+  // -- pixel_type change end
+
   if (fAudio) {
     // buffer overflow patch -- Avery Lee - Mar 2006
     if (lSamples == AVISTREAMREAD_CONVENIENT)
@@ -1152,7 +1476,7 @@ HRESULT CAVIStreamSynth::Read2(LONG lStart, LONG lSamples, LPVOID lpBuffer, LONG
       return S_OK;
     }
 
-    const int image_size = parent->ImageSize();
+    const int image_size = parent->ImageSize(&vi_final);
     if (plSamples) *plSamples = 1;
     if (plBytes) *plBytes = image_size;
 
@@ -1262,7 +1586,7 @@ STDMETHODIMP CAVIStreamSynth::ReadFormat(LONG lPos, LPVOID lpFormat, LONG *lpcbF
         0x0063F, // 7.1 Lf Rf Cf Sw Lr Rr -- -- -- Ls Rs
       };
       wfxt.dwChannelMask = (unsigned)vi->AudioChannels() <= 8 ? SpeakerMasks[vi->AudioChannels()]
-      : (unsigned)vi->AudioChannels() <=18 ? DWORD(-1) >> (32-vi->AudioChannels())
+        : (unsigned)vi->AudioChannels() <=18 ? DWORD(-1) >> (32-vi->AudioChannels())
         : SPEAKER_ALL;
 
       unsigned int userChannelMask = (unsigned)(parent->env->GetVar(VARNAME_dwChannelMask, 0));
@@ -1286,33 +1610,104 @@ STDMETHODIMP CAVIStreamSynth::ReadFormat(LONG lPos, LPVOID lpFormat, LONG *lpcbF
       memcpy(lpFormat, &wfx, size_t(*lpcbFormat));
     }
   } else {
+    bool targetIsConvertedToPackedRGB = (parent->Enable_PlanarToPackedRGB && (vi->IsPlanarRGB() || vi->IsPlanarRGBA()));
+
+    VideoInfo vi_final = *vi;
+    // if basic type is changed, that affects buffer size, we change the format here
+    if (targetIsConvertedToPackedRGB) {
+      // Enable_PlanarToPackedRGB results in packed RGB64 for bits>8, RGB24/32 for 8 bits
+      if (vi->BitsPerComponent() == 8) {
+        if (vi->IsPlanarRGB())
+          vi_final.pixel_type = VideoInfo::CS_BGR24;
+        else // planar RGBA
+          vi_final.pixel_type = VideoInfo::CS_BGR32;
+      }
+      else // all 8+ bit planar RGB(A) is converted to RGB64
+        vi_final.pixel_type = VideoInfo::CS_BGR64;
+    }
+    // silent mapping of 12/14 bit YUV formats to 16 bit
+    if (vi->pixel_type == VideoInfo::CS_YUV420P12 || vi->pixel_type == VideoInfo::CS_YUV420P14 || vi->pixel_type == VideoInfo::CS_YUV420PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV420P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUV422P12 || vi->pixel_type == VideoInfo::CS_YUV422P14 || vi->pixel_type == VideoInfo::CS_YUV422PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV422P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUV444P10 || vi->pixel_type == VideoInfo::CS_YUV444P12 || vi->pixel_type == VideoInfo::CS_YUV444P14 || vi->pixel_type == VideoInfo::CS_YUV444PS)
+      vi_final.pixel_type = VideoInfo::CS_YUV444P16;
+    else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
+      vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+    // -- pixel_type change end
+
     BITMAPINFOHEADER bi;
     memset(&bi, 0, sizeof(bi));
     bi.biSize = sizeof(bi);
-    bi.biWidth = vi->width;
-    bi.biHeight = vi->height;
+    bi.biWidth = vi_final.width;
+    bi.biHeight = vi_final.height;
     bi.biPlanes = 1;
-    bi.biBitCount = (WORD)vi->BitsPerPixel();
+    bi.biBitCount = (WORD)vi_final.BitsPerPixel();
+    if (vi_final.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_V210)
+      bi.biBitCount = 20;
 
-    if (vi->IsRGB())
+    // Enable_PlanarToPackedRGB results in packed RGB64 for bits>8, RGB24/32 for 8 bits
+    if (vi_final.IsRGB() && !vi_final.IsPlanar() && vi_final.BitsPerComponent() == 8)
       bi.biCompression = BI_RGB;
-    else if (vi->IsYUY2())
-      bi.biCompression = '2YUY';
-    else if (vi->IsYV12())
-      bi.biCompression = '21VY';
-    else if (vi->IsY8())
-      bi.biCompression = '008Y';
-    else if (vi->IsYV24())
-      bi.biCompression = '42VY';
-    else if (vi->IsYV16())
-      bi.biCompression = '61VY';
-    else if (vi->IsYV411())
-      bi.biCompression = 'B14Y';
+    else if (vi_final.IsYUY2())
+      bi.biCompression = MAKEFOURCC('Y','U','Y','2');
+    else if (vi_final.IsYV12())
+      bi.biCompression = MAKEFOURCC('Y','V','1','2');
+    else if (vi_final.IsY8())
+      bi.biCompression = MAKEFOURCC('Y','8','0','0');
+    else if (vi_final.IsYV24())
+      bi.biCompression = MAKEFOURCC('Y','V','2','4');
+    else if (vi_final.IsYV16())
+      bi.biCompression = MAKEFOURCC('Y','V','1','6');
+    else if (vi_final.IsYV411())
+      bi.biCompression = MAKEFOURCC('Y','4','1','B');
+    // avs+
+    else if (vi_final.IsRGB64() && parent->Enable_b64a)
+      bi.biCompression = MAKEFOURCC('b','6','4','a');
+    else if (vi_final.IsRGB64())
+      bi.biCompression = MAKEFOURCC('B','R','A',64); // BRA@ ie. BRA[64]
+    else if (vi_final.IsRGB48())
+      bi.biCompression = MAKEFOURCC('B','G','R',48); // BGR0 ie. BGR[48]
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV420P10) 
+      bi.biCompression = MAKEFOURCC('P','0','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV420P16) 
+      bi.biCompression = MAKEFOURCC('P','0','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_Y3_10_10) 
+      bi.biCompression = MAKEFOURCC('Y', '3', 10, 10); // Y3[10][10] (AV_PIX_FMT_YUV422P10) = planar YUV 422*10-bit
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10 && parent->Enable_V210) 
+      bi.biCompression = MAKEFOURCC('v','2','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P10) 
+      bi.biCompression = MAKEFOURCC('P','2','1','0');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P16 && parent->Enable_Y3_10_16) 
+      bi.biCompression = MAKEFOURCC('Y', '3', 10, 16); // Y3[10][16] (AV_PIX_FMT_YUV422P16) = planar YUV 422*16-bit
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV422P16) 
+      bi.biCompression = MAKEFOURCC('P','2','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV444P16 || vi_final.pixel_type == VideoInfo::CS_YUVA444P16) 
+      bi.biCompression = MAKEFOURCC('Y','4','1','6');
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP) 
+      bi.biCompression = MAKEFOURCC('8','B','P','S');
+    // MagicYUV implements these (planar rgb/rgba 10,12,14,16) G3[0][10], G4[0][10], G3[0][12], G4[0][12], G3[0][14], G4[0][14], G3[0][16], G4[0][16]
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP10)
+      bi.biCompression = MAKEFOURCC('G','3',0,10);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP12)
+      bi.biCompression = MAKEFOURCC('G','3',0,12);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP14)
+      bi.biCompression = MAKEFOURCC('G','3',0,14);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBP16)
+      bi.biCompression = MAKEFOURCC('G','3',0,16);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP10)
+      bi.biCompression = MAKEFOURCC('G','4',0,10);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP12)
+      bi.biCompression = MAKEFOURCC('G','4',0,12);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP14)
+      bi.biCompression = MAKEFOURCC('G','4',0,14);
+    else if (vi_final.pixel_type == VideoInfo::CS_RGBAP16)
+      bi.biCompression = MAKEFOURCC('G','4',0,16);
     else {
       _ASSERT(FALSE);
     }
 
-    bi.biSizeImage = parent->ImageSize();
+    bi.biSizeImage = parent->ImageSize(&vi_final);
     *lpcbFormat = min(*lpcbFormat, (LONG)sizeof(bi));
     memcpy(lpFormat, &bi, size_t(*lpcbFormat));
   }
@@ -1320,11 +1715,11 @@ STDMETHODIMP CAVIStreamSynth::ReadFormat(LONG lPos, LPVOID lpFormat, LONG *lpcbF
 }
 
 STDMETHODIMP CAVIStreamSynth::Write(LONG lStart, LONG lSamples, LPVOID lpBuffer,
-                                    LONG cbBuffer, DWORD dwFlags, LONG FAR *plSampWritten,
-                                    LONG FAR *plBytesWritten) {
+  LONG cbBuffer, DWORD dwFlags, LONG FAR *plSampWritten,
+  LONG FAR *plBytesWritten) {
 
-                                      _RPT1(0,"%p->CAVIStreamSynth::Write()\n", this);
+  _RPT1(0,"%p->CAVIStreamSynth::Write()\n", this);
 
-                                      return AVIERR_READONLY;
+  return AVIERR_READONLY;
 }
 

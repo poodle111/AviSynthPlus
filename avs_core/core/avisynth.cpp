@@ -261,7 +261,7 @@ static std::string FormatString(const char *fmt, va_list args)
   va_copy(args2, args);
   _locale_t locale = _create_locale(LC_NUMERIC, "C"); // decimal point: dot
 
-  int count = _vsnprintf_l(NULL, 0, fmt, locale, args);
+  int count = _vsnprintf_l(NULL, 0, fmt, locale, args); 
   std::vector<char> buf(count + 1);
   _vsnprintf_l(buf.data(), buf.size(), fmt, locale, args2);
 
@@ -723,6 +723,8 @@ public:
   virtual void __stdcall LogMsg_valist(int level, const char* fmt, va_list va);
   virtual void __stdcall LogMsgOnce(const OneTimeLogTicket &ticket, int level, const char* fmt, ...);
   virtual void __stdcall LogMsgOnce_valist(const OneTimeLogTicket &ticket, int level, const char* fmt, va_list va);
+  virtual void __stdcall VThrowError(const char* fmt, va_list va);
+  virtual PVideoFrame __stdcall SubframePlanarA(PVideoFrame src, int rel_offset, int new_pitch, int new_row_size, int new_height, int rel_offsetU, int rel_offsetV, int new_pitchUV, int rel_offsetA);
 
 private:
 
@@ -1611,6 +1613,9 @@ void ScriptEnvironment::ListFrameRegistry(size_t min_size, size_t max_size, bool
 VideoFrame* ScriptEnvironment::GetNewFrame(size_t vfb_size)
 {
   std::unique_lock<std::recursive_mutex> env_lock(memory_mutex);
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT1(0, "ScScriptEnvironment::GetNewFrame memory mutex lock: %p\n", (void *)&memory_mutex);
+#endif
 
   /* -----------------------------------------------------------
    *   Try to return an unused but already allocated instance
@@ -2198,6 +2203,9 @@ PVideoFrame __stdcall ScriptEnvironment::Subframe(PVideoFrame src, int rel_offse
   size_t vfb_size = src->GetFrameBuffer()->GetDataSize();
 
   std::unique_lock<std::recursive_mutex> env_lock(memory_mutex); // vector needs locking!
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT1(0, "ScScriptEnvironment::SubFrame memory mutext lock: %p\n", (void *)&memory_mutex);
+#endif
   // automatically inserts if not exists!
   assert(NULL != subframe);
   FrameRegistry2[vfb_size][src->GetFrameBuffer()].push_back(DebugTimestampedFrame(subframe)); // insert with timestamp!
@@ -2216,6 +2224,9 @@ PVideoFrame __stdcall ScriptEnvironment::SubframePlanar(PVideoFrame src, int rel
   size_t vfb_size = src->GetFrameBuffer()->GetDataSize();
 
   std::unique_lock<std::recursive_mutex> env_lock(memory_mutex); // vector needs locking!
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT1(0, "ScScriptEnvironment::SubFramePlanar memory mutext lock: %p\n", (void *)&memory_mutex);
+#endif
   // automatically inserts if not exists!
   assert(subframe != NULL);
   FrameRegistry2[vfb_size][src->GetFrameBuffer()].push_back(DebugTimestampedFrame(subframe)); // insert with timestamp!
@@ -2235,6 +2246,9 @@ PVideoFrame __stdcall ScriptEnvironment::SubframePlanar(PVideoFrame src, int rel
 
     std::unique_lock<std::recursive_mutex> env_lock(memory_mutex); // vector needs locking!
                                                          // automatically inserts if not exists!
+#ifdef DEBUG_GSCRIPTCLIP_MT
+    _RPT1(0, "ScScriptEnvironment::SubFramePlanar(2) memory mutext lock: %p\n", (void *)&memory_mutex);
+#endif
     assert(subframe != NULL);
     FrameRegistry2[vfb_size][src->GetFrameBuffer()].push_back(DebugTimestampedFrame(subframe)); // insert with timestamp!
 
@@ -2246,8 +2260,13 @@ void* ScriptEnvironment::ManageCache(int key, void* data) {
 // ScriptEnvironment class without extending the IScriptEnvironment
 // definition.
 
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT3(0, "ScriptEnvironment::ManageCache %d memory mutex try to lock: %p thread %d\n", key, (void *)&memory_mutex, GetCurrentThreadId());
+  std::unique_lock<std::recursive_mutex> env_lock(memory_mutex);
+  _RPT2(0, "ScriptEnvironment::ManageCache memory mutex lock ok: %p thread %d\n", (void *)&memory_mutex, GetCurrentThreadId());
+#else
   std::lock_guard<std::recursive_mutex> env_lock(memory_mutex);
-
+#endif
   switch((MANAGE_CACHE_KEYS)key)
   {
   // Called by Cache instances upon creation
@@ -2316,8 +2335,12 @@ void* ScriptEnvironment::ManageCache(int key, void* data) {
   case MC_NodCache:
   {
     Cache* cache = reinterpret_cast<Cache*>(data);
-    if (cache == FrontCache)
+    if (cache == FrontCache) {
+#ifdef DEBUG_GSCRIPTCLIP_MT
+      env_lock.unlock();
+#endif
       return 0;
+    }
 
     CacheRegistry.move_to_back(cache);
     break;
@@ -2351,6 +2374,9 @@ void* ScriptEnvironment::ManageCache(int key, void* data) {
     break;
   }
   } // switch
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT2(0, "ScriptEnvironment::ManageCache memory mutex will unlock on release: %p thread=%d\n", (void *)&memory_mutex, GetCurrentThreadId());
+#endif
   return 0;
 }
 
@@ -2382,12 +2408,17 @@ bool ScriptEnvironment::PlanarChromaAlignment(IScriptEnvironment::PlanarChromaAl
    If 'dst' is NULL, will still return the number of elements
    that would have been written to 'dst', but will not actually write to 'dst'.
 */
-static size_t Flatten(const AVSValue& src, AVSValue* dst, size_t index, const char* const* arg_names = NULL) {
-  if (src.IsArray()) {
+static size_t Flatten(const AVSValue& src, AVSValue* dst, size_t index, int level, const char* const* arg_names = NULL) {
+  // level is starting from zero
+  if (src.IsArray() 
+#ifdef NEW_AVSVALUE
+    && level == 0
+#endif
+    ) { // flatten for the first arg level
     const int array_size = src.ArraySize();
     for (int i=0; i<array_size; ++i) {
       if (!arg_names || arg_names[i] == 0)
-        index = Flatten(src[i], dst, index);
+        index = Flatten(src[i], dst, index, level+1);
     }
   } else {
     if (dst != NULL)
@@ -2414,11 +2445,13 @@ const AVSFunction* ScriptEnvironment::Lookup(const char* search_name, const AVSV
 
       // then, look for a built-in function
       for (int i = 0; i < sizeof(builtin_functions)/sizeof(builtin_functions[0]); ++i)
-        for (const AVSFunction* j = builtin_functions[i]; !j->empty(); ++j)
+        for (const AVSFunction* j = builtin_functions[i]; !j->empty(); ++j) 
+        {
           if (streqi(j->name, search_name) &&
-              AVSFunction::TypeMatch(j->param_types, args, num_args, pstrict, this) &&
-              AVSFunction::ArgNameMatch(j->param_types, args_names_count, arg_names))
+            AVSFunction::TypeMatch(j->param_types, args, num_args, pstrict, this) &&
+            AVSFunction::ArgNameMatch(j->param_types, args_names_count, arg_names))
             return j;
+        }
     }
     // Try again without arg name matching
     oanc = args_names_count;
@@ -2444,13 +2477,31 @@ AVSValue ScriptEnvironment::Invoke(const char* name, const AVSValue args, const 
   {
     throw NotFound();
   }
-
+#ifdef NEW_AVSVALUE
+  // args parameter is an array, and on exiting from here its destructor is called.
+  // But if this AVSValue was created by a v2.5 caller plugin (baked code in avisynth.h)
+  // we can't use the smart way and free up the array elements, because the child AVSValue's are
+  // owned by the plugin itself.
+  // Unfortunately at this point we do not know who is calling Invoke.
+  // If AVSValue was created by a v2.5 interface, we get and exception when trying to free up
+  // childs.
+  if (!stricmp(name, "Blackness")) // now to decide that call came from v2.5 interface?
+  {
+//    const_cast<AVSValue *>(&args)->MarkArrayAsC();
+  }
+#endif
   return result;
 }
 
 bool __stdcall ScriptEnvironment::Invoke(AVSValue *result, const char* name, const AVSValue& args, const char* const* arg_names)
 {
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT3(0, "ScriptEnvironment::Invoke %s try memory lock %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+  std::unique_lock<std::recursive_mutex> env_lock(memory_mutex);
+  _RPT3(0, "ScriptEnvironment::Invoke %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#else
   std::lock_guard<std::recursive_mutex> env_lock(memory_mutex);
+#endif
 
   bool strict = false;
   const AVSFunction *f;
@@ -2466,19 +2517,21 @@ bool __stdcall ScriptEnvironment::Invoke(AVSValue *result, const char* name, con
   const int args_names_count = (arg_names && args.IsArray()) ? args.ArraySize() : 0;
 
   // get how many args we will need to store
-  size_t args2_count = Flatten(args, NULL, 0, arg_names);
+  size_t args2_count = Flatten(args, NULL, 0, 0, arg_names);
   if (args2_count > ScriptParser::max_args)
     ThrowError("Too many arguments passed to function (max. is %d)", ScriptParser::max_args);
 
   // flatten unnamed args
   std::vector<AVSValue> args2(args2_count, AVSValue());
-  Flatten(args, args2.data(), 0, arg_names);
+  Flatten(args, args2.data(), 0, 0, arg_names);
 
   bool foundClipArgument = false;
   for (auto &argx : args2)
   {
-      assert(!argx.IsArray());
-
+#ifndef NEW_AVSVALUE
+    assert(!argx.IsArray()); // todo: we can have arrays 161106 
+#endif
+    // todo PF 161112 new arrays: recursive look into arrays whether they contain clips
       if (argx.IsClip())
       {
           foundClipArgument = true;
@@ -2489,7 +2542,10 @@ bool __stdcall ScriptEnvironment::Invoke(AVSValue *result, const char* name, con
 
           if (!data->CreatedByInvoke)
           {
-              mthelper.AddChainedFilter(clip, this->DefaultMtMode);
+#ifdef DEBUG_GSCRIPTCLIP_MT
+            _RPT3(0, "ScriptEnvironment::Invoke.AddChainedFilter %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
+            mthelper.AddChainedFilter(clip, this->DefaultMtMode);
           }
 
           // Wrap this input parameter into a guard exit, which is used when
@@ -2557,10 +2613,16 @@ bool __stdcall ScriptEnvironment::Invoke(AVSValue *result, const char* name, con
           if (strlen(arg_names[i]) == size_t(q-p) && !_strnicmp(arg_names[i], p, q-p)) {
             // we have a match
             if (args3[named_arg_index].Defined()) {
+              // so named args give can't have .+ specifier
               ThrowError("Script error: the named argument \"%s\" was passed more than once to %s", arg_names[i], name);
-            } else if (args[i].IsArray()) {
+            } 
+#ifndef NEW_AVSVALUE
+            //PF 161028 AVS+ arrays as named arguments
+              else if (args[i].IsArray()) {
               ThrowError("Script error: can't pass an array as a named argument");
-            } else if (args[i].Defined() && !AVSFunction::SingleTypeMatch(q[1], args[i], false)) {
+            }
+#endif
+              else if (args[i].Defined() && !AVSFunction::SingleTypeMatch(q[1], args[i], false)) {
               ThrowError("Script error: the named argument \"%s\" to %s had the wrong type", arg_names[i], name);
             } else {
               args3[named_arg_index] = args[i];
@@ -2584,7 +2646,7 @@ success:;
 
   // ... and we're finally ready to make the call
   std::unique_ptr<const FilterConstructor> funcCtor = std::make_unique<const FilterConstructor>(this, f, &args2, &args3);
-  _RPT1(0, "ScriptEnvironment::Invoke %s\r\n", name); // P.F.
+  _RPT1(0, "ScriptEnvironment::Invoke after funcCtor make unique %s\r\n", name);
 
   if (funcCtor->IsScriptFunction())
   {
@@ -2595,6 +2657,25 @@ success:;
       LogMsgOnce(ticket, LOGLEVEL_WARNING, "An MT-mode is set for %s() but it is a script function. You can only set the MT-mode for binary filters, for scripted functions it will be ignored.", f->name);
     }
 
+#ifdef DEBUG_GSCRIPTCLIP_MT
+#ifdef _DEBUG
+    _RPT1(0, "ScriptEnvironment::Invoke.IsScriptFunction before funcCtor->InstantiateFilter %s\r\n", name); // P.F.
+#endif
+    /*
+    if(funcCtor->IsRuntimeScriptFunction())
+      env_lock.unlock();
+    */
+    /*
+      if this is here, we get heap corruption (var table pop context?)
+      if this is not here, and the filter is runtime filter, such as YPlaneMax, then inside
+      YPlaneMax the child->GetFrame will go into deadlock, as the memory mutex is still held,
+      but the GetFrame goes through the cache, and the ManageCache (Nop) call can't get this
+      very same memory mutex since our Invoke (see above) still holds it. 
+      Because there the ManageCache may use another (core?) thread id
+      and cannot obtain the lock :(((
+      YPlaneMax (MinMax) calls child->GetFrame, that can Invoke srestore_inside1 again but from a different thread.
+      */
+#endif
     *result = funcCtor->InstantiateFilter();
 #ifdef _DEBUG
     _RPT1(0, "ScriptEnvironment::Invoke done funcCtor->InstantiateFilter %s\r\n", name); // P.F.
@@ -2602,27 +2683,49 @@ success:;
   }
   else
   {
+#ifdef DEBUG_GSCRIPTCLIP_MT
+    _RPT3(0, "ScriptEnvironment::Invoke.WasNotScriptFunction %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
 #ifdef _DEBUG
     Cache *PrevFrontCache = FrontCache;
 #endif
 
     AVSValue fret;
-    invoke_stack.push(&mthelper);
-    try
+
+#ifdef DEBUG_GSCRIPTCLIP_MT
+    if (funcCtor->IsRuntimeScriptFunction()) {
+      _RPT3(0, "ScriptEnvironment::Invoke.IsRuntimeScriptFunction funcCtor->InstantiateFilter() %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+      env_lock.unlock();
+      fret = funcCtor->InstantiateFilter();
+      if(!fret.IsClip())
+        _RPT3(0, "ScriptEnvironment::Invoke: Fret is not clip. %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+    }
+    else 
+#endif
     {
+      invoke_stack.push(&mthelper);
+      try
+      {
+#ifdef DEBUG_GSCRIPTCLIP_MT
+        _RPT3(0, "ScriptEnvironment::Invoke.funcCtor->InstantiateFilter() %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
         fret = funcCtor->InstantiateFilter();
         invoke_stack.pop();
-    }
-    catch(...)
-    {
+      }
+      catch (...)
+      {
         invoke_stack.pop();
         throw;
+      }
     }
 
     // Determine MT-mode, as if this instance had not called Invoke()
     // in its constructor. Note that this is not necessary the final
     // MT-mode.
-    if (fret.IsClip())
+    // PF 161012 hack(?) don't call if prefetch. If effective mt mode is MT_MULTI, then
+    // Prefetch create gets called again
+    // Prefetch is activated above in: fret = funcCtor->InstantiateFilter();
+    if (fret.IsClip() && strcmp(f->name, "Prefetch")) 
     {
         const PClip &clip = fret.AsClip();
 
@@ -2632,7 +2735,10 @@ success:;
 
         if (chainedCtor)
         {
-            // Propagate information about our children's MT-safety
+#ifdef DEBUG_GSCRIPTCLIP_MT
+          _RPT3(0, "ScriptEnvironment::Invoke.chainedCtor %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
+          // Propagate information about our children's MT-safety
             // to our parent.
             invoke_stack.top()->Accumulate(mthelper);
 
@@ -2668,7 +2774,10 @@ success:;
             {
                 for (auto &ge : GuardExits)
                 {
-                    ge->Activate(guard);
+#ifdef DEBUG_GSCRIPTCLIP_MT
+                  _RPT3(0, "ScriptEnvironment::Invoke.ActivateGuard %s memory mutex lock: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
+                  ge->Activate(guard);
                 }
             }
 
@@ -2729,6 +2838,9 @@ success:;
     }
 #endif
   }
+#ifdef DEBUG_GSCRIPTCLIP_MT
+  _RPT3(0, "ScriptEnvironment::Invoke %s memory mutex unlock soon: %p thread %d\n", name, (void *)&memory_mutex, GetCurrentThreadId());
+#endif
 
   return true;
 }
@@ -2799,12 +2911,17 @@ char* ScriptEnvironment::Sprintf(const char* fmt, ...) {
 
 void ScriptEnvironment::ThrowError(const char* fmt, ...)
 {
+  va_list val;
+  va_start(val, fmt);
+  VThrowError(fmt, val);
+  va_end(val);
+}
+
+void ScriptEnvironment::VThrowError(const char* fmt, va_list va)
+{
   std::string msg;
   try {
-    va_list val;
-    va_start(val, fmt);
-    msg = FormatString(fmt, val);
-    va_end(val);
+    msg = FormatString(fmt, va);
   } catch (...) {
     msg = "Exception while processing ScriptEnvironment::ThrowError().";
   }
@@ -2814,6 +2931,11 @@ void ScriptEnvironment::ThrowError(const char* fmt, ...)
 
   // Throw...
   throw AvisynthError(ScriptEnvironment::SaveString(msg.c_str()));
+}
+
+PVideoFrame ScriptEnvironment::SubframePlanarA(PVideoFrame src, int rel_offset, int new_pitch, int new_row_size, int new_height, int rel_offsetU, int rel_offsetV, int new_pitchUV, int rel_offsetA)
+{
+  return SubframePlanar(src, rel_offset, new_pitch, new_row_size, new_height, rel_offsetU, rel_offsetV, new_pitchUV, rel_offsetA);
 }
 
 

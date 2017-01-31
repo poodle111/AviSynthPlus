@@ -62,6 +62,8 @@ public:
 
 private:
   void ApplyYV12(BYTE* buf, int pitch, int UVpitch,BYTE* bufV,BYTE* bufU);
+  template<int shiftX, int shiftY, int bits_per_pixel>
+  void ApplyPlanar_core(BYTE* buf, int pitch, int UVpitch,BYTE* bufV,BYTE* bufU);
   void ApplyPlanar(BYTE* buf, int pitch, int UVpitch,BYTE* bufV,BYTE* bufU, int shiftX, int shiftY, int pixelsize);
   void ApplyYUY2(BYTE* buf, int pitch);
   void ApplyRGB24_48(BYTE* buf, int pitch, int pixelsize);
@@ -175,7 +177,7 @@ class FilterInfo : public GenericVideoFilter
  **/
 {
 public:
-  FilterInfo( PClip _child);
+  FilterInfo( PClip _child, bool _font_override, const char _fontname[], int _size, int _textcolor, int _halocolor, IScriptEnvironment* env);
   virtual ~FilterInfo(void);
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env);
   bool __stdcall GetParity(int n);
@@ -191,6 +193,10 @@ private:
   const VideoInfo& AdjustVi();
 
   const VideoInfo &vii;
+
+  const int size;
+  const bool font_override;
+
   Antialiaser antialiaser;  
 };
 
